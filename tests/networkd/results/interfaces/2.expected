@@ -1,0 +1,5 @@
+Name: test_eth0.1556 MAC:  Addresses: [1.2.3.4/24 1.2.3.43/24 fc00::2/64] Gateway4: 1.2.3.1 Gateway6: fc00::1 Routes: [10.0.0.0/24 via 1.2.3.5 metric 100]
+Name: test_eth0 MAC:  Addresses: [] Gateway4: <nil> Gateway6: <nil> Routes: []
+Name: test_eth1.1557 MAC:  Addresses: [fc00:aa8:7160:d9eb:1:0:1:3/64] Gateway4: <nil> Gateway6: <nil> Routes: [fc00:5aa8:7160:d9eb::1/128 via fe80::1 metric 200]
+Name: test_eth1 MAC:  Addresses: [] Gateway4: <nil> Gateway6: <nil> Routes: []
+Name: test_eth2 MAC:  Addresses: [203.0.113.2/24 abcd:ef12:3456:10::4/64 203.0.113.3/24] Gateway4: 203.0.113.1 Gateway6: abcd:ef12:3456:10::1 Routes: [abcd:ef12:3455:10::/64 via abcd:ef12:3456:10::1 metric 100, 10.253.2.0/24 via 203.0.113.22 metric 100]

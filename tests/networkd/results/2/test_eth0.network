@@ -1,0 +1,13 @@
+[Match]
+PermanentMACAddress = 52:54:00:b9:ab:93
+Name                = test_eth0
+
+[Link]
+MTUBytes = 1500
+
+[Network]
+LinkLocalAddressing = ipv6
+VLAN                = test_eth0.1556
+Address             = 1.2.10.4/24
+Gateway             = 1.2.10.254
+Domains             = 

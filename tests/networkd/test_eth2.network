@@ -1,0 +1,15 @@
+[Match]
+PermanentMACAddress=52:54:00:8b:cd:93
+Name=test_eth2
+
+[Link]
+MTUBytes=1500
+
+[Network]
+LinkLocalAddressing=ipv6
+Address=203.0.113.2/24
+Address=abcd:ef12:3456:10::4/64
+Address=203.0.113.3/24
+Gateway=203.0.113.1
+Gateway=abcd:ef12:3456:10::1
+DNS=10.0.0.1

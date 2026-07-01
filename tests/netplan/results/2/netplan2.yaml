@@ -1,0 +1,12 @@
+network:
+    version: 2
+    vlans:
+        test_eth1.1557:
+            id: 1557
+            link: test_eth1
+            addresses:
+                - fc00:aa8:7160:d9eb:1:0:1:3/64
+            nameservers:
+                search: [example.com, maas]
+                addresses: [10.0.0.1]
+            mtu: 1500

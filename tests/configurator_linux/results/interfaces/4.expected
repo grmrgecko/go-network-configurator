@@ -1,0 +1,2 @@
+Name: test_enp1s0 MAC: 52:54:00:8b:0d:93 Addresses: [1.2.3.5/24] Gateway4: <nil> Gateway6: <nil> Routes: []
+Name: test_enp2s0 MAC: 52:54:00:8b:ad:93 Addresses: [fc00:5aa8:7160:d9eb:1:0:1:5/64] Gateway4: <nil> Gateway6: fc00:5aa8:7160:d9eb:: Routes: [fc00:5aa8:7160:d9eb::1/128 via fe80::1 metric 200]

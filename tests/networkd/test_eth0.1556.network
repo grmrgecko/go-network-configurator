@@ -1,0 +1,18 @@
+[Match]
+Name=test_eth0.1556
+
+[Link]
+MTUBytes=1500
+
+[Network]
+LinkLocalAddressing=ipv6
+Address=1.2.3.4/24
+Gateway=1.2.3.1
+DNS=10.0.0.1
+Domains=example.com maas
+ConfigureWithoutCarrier=yes
+
+[Route]
+Destination=10.0.0.0/24
+Gateway=1.2.3.5
+Metric=100

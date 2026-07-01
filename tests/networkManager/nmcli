@@ -1,0 +1,4 @@
+#!/bin/bash
+
+mkdir -p /tmp/networkManager-netconfig-Test
+echo $@ >> /tmp/networkManager-netconfig-Test/test

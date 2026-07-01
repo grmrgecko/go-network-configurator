@@ -1,0 +1,10 @@
+[Match]
+PermanentMACAddress=52:54:00:8b:0d:93
+Name=test_eth1
+
+[Link]
+MTUBytes=1500
+
+[Network]
+LinkLocalAddressing=ipv6
+VLAN=test_eth1.1557

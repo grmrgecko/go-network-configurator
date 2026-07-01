@@ -1,0 +1,22 @@
+network:
+    ethernets:
+        test_enp1s0:
+            addresses:
+                - 1.2.3.5/24
+            match:
+                macaddress: 52:54:00:8b:0d:93
+            mtu: 1500
+            set-name: test_enp1s0
+        test_enp2s0:
+            addresses:
+                - fc00:5aa8:7160:d9eb:1:0:1:5/64
+            gateway6: 'fc00:5aa8:7160:d9eb::'
+            match:
+                macaddress: 52:54:00:8b:ad:93
+            mtu: 1500
+            routes:
+                - metric: 200
+                  to: fc00:5aa8:7160:d9eb::1/128
+                  via: fe80::1
+            set-name: test_enp2s0
+    version: 2

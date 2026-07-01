@@ -1,0 +1,31 @@
+network:
+    version: 2
+    ethernets:
+        test_eth0:
+            match:
+                macaddress: 52:54:00:b9:ab:93
+            set-name: test_eth0
+            mtu: 1500
+        test_eth1:
+            match:
+                macaddress: 52:54:00:8b:0d:93
+            set-name: test_eth1
+            mtu: 1500
+        test_eth3:
+            gateway4: 203.0.113.1
+            mtu: 1500
+    vlans:
+        test_eth0.1556:
+            id: 1556
+            link: test_eth0
+            addresses:
+                - 1.2.3.4/24
+            gateway4: 1.2.3.1
+            routes:
+            - to: 10.0.0.0/24
+              via: 1.2.3.5
+              metric: 100
+            nameservers:
+                search: [example.com, maas]
+                addresses: [10.0.0.1]
+            mtu: 1500

@@ -1,0 +1,67 @@
+
+auto test_wg0
+iface test_eth0
+	address 203.0.113.2/24
+	address fc00::2/64
+	gateway 203.0.113.6
+	gateway fc00::1
+	up /usr/local/bin/etho-up.sh
+	down /usr/local/bin/etho-down.sh
+	up ip addr add 203.0.113.3/24 dev $IFACE
+	down ip addr del 203.0.113.3/24 dev $IFACE
+	up ip route add 10.23.1.0/24 via 203.0.113.4 metric 256 dev $IFACE
+	down ip route del 10.23.1.0/24 via 203.0.113.4 metric 256 dev $IFACE
+
+iface test_wg0
+	use wireguard
+	address 1.4.3.4/24
+	requires eth0
+
+iface test_v6
+	address 2001:470:1f10::1
+
+iface test_v4
+	address 203.0.115.2
+
+iface test_eth0.8
+	address 2001:db8:1000:2::2/64
+
+iface test_servers
+	vlan-raw-device eth0
+	vlan-id 8
+	address 2001:db8:1002:2::2/64
+
+iface test_lo inet loopback
+
+auto test_eth1
+
+auto test_backend
+iface test_eth1
+	address 1.2.3.4/24
+	address abcd:ef12:3456:3::4/64
+	mtu 8000
+	up ip -6 route add abcd:ef12:3455:3::/64 via abcd:ef12:3456:3::1 metric 100 dev $IFACE
+	down ip -6 route del abcd:ef12:3455:3::/64 via abcd:ef12:3456:3::1 metric 100 dev $IFACE
+	up ip route add 10.253.2.0/24 via 1.2.3.1 metric 100 dev $IFACE
+	down ip route del 10.253.2.0/24 via 1.2.3.1 metric 100 dev $IFACE
+
+iface test_backend
+    address 1.2.10.4/24
+    gateway 1.2.10.1
+    address abcd:ef12:3456:10::4/64
+    gateway abcd:ef12:3456:10::1
+    mtu 8000
+    vlan-raw-device eth0
+    vlan_id 5
+
+auto test_eth2
+iface test_eth2
+	address 2001:db8:1003:2::2
+	netmask 112
+	gateway 2001:db8:1003:2::1
+
+auto test_eth3
+iface test_eth3
+	address 203.0.114.2
+	netmask 255.255.255.248
+	gateway 203.0.114.1
