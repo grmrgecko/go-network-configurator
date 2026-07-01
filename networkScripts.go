@@ -44,6 +44,43 @@ type networkScripts struct {
 	backupRetention int
 }
 
+// nsDHCPState reports whether an ifcfg file's keys enable a DHCP client for
+// each family. BOOTPROTO names the IPv4 method — "dhcp" and the near-extinct
+// "bootp" are the dynamic ones, and any other value, including an absent key,
+// means the address is configured statically. The IPv6 client is separate and
+// off unless DHCPV6C says otherwise.
+func nsDHCPState(config map[string]string) (dhcp4, dhcp6 bool) {
+	switch strings.ToLower(config["BOOTPROTO"]) {
+	case "dhcp", "bootp":
+		dhcp4 = true
+	}
+	switch strings.ToLower(config["DHCPV6C"]) {
+	case "yes", "true", "1":
+		dhcp6 = true
+	}
+	return dhcp4, dhcp6
+}
+
+// nsSetDHCP writes the DHCP client state into an ifcfg config map. Disabling
+// IPv4 leaves BOOTPROTO=none rather than deleting it: unlike the netplan and
+// networkd schemas, an absent BOOTPROTO is read by some initscript versions as
+// a prompt to guess, and "none" states the intent. PERSISTENT_DHCLIENT only has
+// meaning while the IPv4 client runs, so it goes with it.
+func nsSetDHCP(config map[string]string, dhcp4, dhcp6 bool) {
+	if dhcp4 {
+		config["BOOTPROTO"] = "dhcp"
+	} else {
+		config["BOOTPROTO"] = "none"
+		delete(config, "PERSISTENT_DHCLIENT")
+	}
+	if dhcp6 {
+		config["IPV6INIT"] = "yes"
+		config["DHCPV6C"] = "yes"
+	} else {
+		delete(config, "DHCPV6C")
+	}
+}
+
 // Either retreives an existing interface, or makes a new one.
 func (ns *networkScripts) EnsureInterface(name string) *nsInterface {
 	// Find existing interface and return it.
@@ -523,6 +560,12 @@ func (ns *networkScripts) GetInterfaces() (interfaces []*Interface, err error) {
 
 		// Parse interface files.
 		for _, file := range iface.IFFiles {
+			// Read the DHCP client state. Any of an interface's files enabling
+			// a client means the interface runs one.
+			dhcp4, dhcp6 := nsDHCPState(file.Config)
+			i.DHCP4 = i.DHCP4 || dhcp4
+			i.DHCP6 = i.DHCP6 || dhcp6
+
 			// Parse IPv4 addresses in the file.
 			ipAddr := ns.ParseIP(file.Config, "")
 			if ipAddr != nil {
@@ -828,6 +871,42 @@ func (ns *networkScripts) SetIfaceAddresses(_ context.Context, iface string, add
 	}
 
 	return
+}
+
+// Set the DHCP client state on an interface.
+func (ns *networkScripts) SetIfaceDHCP(_ context.Context, iface string, dhcp4, dhcp6 bool) (err error) {
+	// Find or create the interface. A backend must not silently no-op just
+	// because it has not seen this interface before (e.g. a freshly attached
+	// NIC), otherwise the caller gets a success with no persisted change.
+	ifc := ns.EnsureInterface(iface)
+
+	// Merge configs.
+	config := make(map[string]string)
+	for _, file := range ifc.IFFiles {
+		err = mergo.Merge(&config, file.Config)
+		if err != nil {
+			return err
+		}
+	}
+
+	nsSetDHCP(config, dhcp4, dhcp6)
+
+	// Try to save.
+	return ifc.Save(config, ns.ConfigDir, ns.backupRetention)
+}
+
+// renewDHCP restarts the interface through the initscripts so the DHCP client
+// that was just written to its ifcfg file is started. `ifup` on an interface
+// that is already up is a no-op on these distributions, so it is taken down
+// first; this is the same ifdown/ifup pair the initscripts themselves use, and
+// it is what acquires the lease.
+func (ns *networkScripts) renewDHCP(ctx context.Context, iface string) error {
+	// ifdown on an interface that is already down exits non-zero. That is not a
+	// failure of this call — the interface being down is the state ifup wants —
+	// so only the ifup result decides.
+	_, _ = runCommand(ctx, "ifdown", iface)
+	_, err := runCommand(ctx, "ifup", iface)
+	return err
 }
 
 // Set static routes to interface.

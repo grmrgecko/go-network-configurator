@@ -3,12 +3,12 @@ package netconfig
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
+	"syscall"
 
-	dbus "github.com/coreos/go-systemd/dbus"
 	"github.com/vishvananda/netlink"
 )
 
@@ -21,86 +21,83 @@ type linuxConfigurator struct {
 	*configOptions
 }
 
-// Returns the linux network configurator. Behaviour is tuned with Option
-// values such as WithTestAddress and WithConnectivityCheck; use SetLogger to
-// replace the package-wide logger.
-func NewConfigurator(opts ...Option) (configurator Configurator, err error) {
+// Returns the linux network configurator. Backends are auto-detected; ctx
+// bounds that detection, which queries systemd over D-Bus and may shell out to
+// chkconfig and netplan. Behaviour is tuned with Option values such as
+// WithTestAddress and WithConnectivityCheck; use SetLogger to replace the
+// package-wide logger.
+func NewConfigurator(ctx context.Context, opts ...Option) (Configurator, error) {
 	options := newConfigOptions(opts...)
-	// Connect to dbus for systemd and list active units to determine which
-	// network managers are running. This fails on systems without a usable
-	// systemd D-Bus interface, so we fall back to detecting legacy managers:
-	//   - Ubuntu 14.04: Upstart is PID 1 and org.freedesktop.systemd1 is served
-	//     by systemd-shim, which lacks ListUnits ("No such method 'ListUnits'").
-	//   - CentOS 5/6: no systemd1 on the bus at all, so ListUnits (or the
-	//     connection itself) fails with ServiceUnknown.
-	activeUnits := make(map[string]bool)
-	conn, derr := dbus.NewWithContext(context.Background())
-	if derr == nil {
-		defer conn.Close()
-		var units []dbus.UnitStatus
-		units, derr = conn.ListUnitsContext(context.Background())
-		for _, unit := range units {
-			if unit.ActiveState == "active" {
-				activeUnits[unit.Name] = true
-			}
-		}
-	}
-	if derr != nil {
-		logger.Printf("unable to list systemd units, falling back to legacy detection: %v", derr)
-		activeUnits = legacyActiveUnits()
-	}
 
-	// Determine candidates based on unit status.
+	// Snapshot what the init system knows about its units once. Every backend
+	// check below is answered from it, falling back to the SysV mechanisms for
+	// any service systemd cannot speak for.
+	initSys := newInitState(ctx)
+
 	c := new(linuxConfigurator)
 	c.configOptions = options
-	configurator = c
 
 	// Detect each backend. A nil concrete pointer wrapped in an interface is
 	// itself non-nil, so backends are collected as concrete pointers here and
-	// only registered below when non-nil.
+	// only registered below when non-nil. Each constructor's error is kept local:
+	// a backend that fails to parse is skipped, not fatal, and must not leak into
+	// the error returned to the caller.
 	var (
 		nd  *networkd
 		nm  *networkManager
 		ns  *networkScripts
 		iud *ifUpDown
 		np  *netplan
-		ci  *cloudInit
 	)
-	if activeUnits["systemd-networkd.service"] {
-		nd, err = newNetworkd(options.backupRetention)
-		if err != nil {
+	if initSys.detected(ctx, "systemd-networkd") {
+		var err error
+		if nd, err = newNetworkd(options.backupRetention); err != nil {
 			logger.Println("error parsing networkd config:", err)
 		}
 	}
-	if activeUnits["NetworkManager.service"] {
-		nm, err = newNetworkManager()
-		if err != nil {
+
+	// NetworkManager's pid file is checked as well as its unit, so the daemon is
+	// still found on a host whose systemd could not be queried. Detection here
+	// includes a unit that is enabled but not yet started, so newNetworkManager
+	// waits for the daemon to reach the bus and finish starting: this program
+	// may be run early enough in boot to beat it, and NetworkManager is
+	// configured through that daemon rather than through a file.
+	if initSys.detected(ctx, "NetworkManager") || networkManagerRunning() {
+		var err error
+		if nm, err = newNetworkManager(ctx, options.serviceReadyTimeout); err != nil {
 			logger.Println("error parsing network manager config:", err)
 		}
 	}
-	if activeUnits["network.service"] {
-		ns, err = newNetworkScripts(options.backupRetention)
-		if err != nil {
+
+	// The RHEL-family network-scripts service. newNetworkScripts returns an error
+	// when /etc/sysconfig/network-scripts is absent, so a host that has the
+	// service registered but no scripts directory registers no backend.
+	if initSys.detected(ctx, "network") {
+		var err error
+		if ns, err = newNetworkScripts(options.backupRetention); err != nil {
 			logger.Println("error parsing network scripts:", err)
 		}
 	}
 
-	// If the ifupdown config exists, add its config.
-	if _, serr := os.Stat(ifUpDownConfig); serr == nil {
-		iud, err = newIfUpDown(options.backupRetention)
-		if err != nil {
-			logger.Println("error prasing ifupdown:", err)
+	if ifUpDownDetected(ctx, initSys) {
+		var err error
+		if iud, err = newIfUpDown(options.backupRetention); err != nil {
+			logger.Println("error parsing ifupdown:", err)
 		}
 	}
 
-	_, err = exec.LookPath("netplan")
-	if err == nil {
-		np, err = newNetplan(options.backupRetention)
-		if err != nil {
+	// netplan is gated on its binary resolving before newNetplan runs `netplan
+	// info`, so a host without netplan pays no subprocess and logs no failure.
+	if commandExists("netplan") {
+		var err error
+		if np, err = newNetplan(ctx, options.backupRetention); err != nil {
 			logger.Println("error parsing netplan:", err)
 		}
 	}
-	ci, err = newCloudInit(options.backupRetention)
+
+	// cloud-init has no service to detect: it runs once at boot and is found by
+	// its configuration alone, which newCloudInit reports on.
+	ci, err := newCloudInit(options.backupRetention)
 	if err != nil {
 		logger.Println("error parsing cloud-init:", err)
 	}
@@ -126,6 +123,21 @@ func NewConfigurator(opts ...Option) (configurator Configurator, err error) {
 		c.ifaceBackends = append(c.ifaceBackends, namedIfaceBackend{"IfUpDown", iud})
 	}
 
+	// A host with no file backend can still have its running state changed through
+	// netlink, but nothing would persist and the change would vanish on the next
+	// boot. Fail here rather than hand back a configurator that silently writes
+	// nowhere; WithAllowNoBackends opts into it for read-only callers.
+	if len(c.ifaceBackends) == 0 {
+		// A cancelled context aborts every probe above, which looks identical to
+		// a host that genuinely has no backend. Report the real cause.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, fmt.Errorf("backend detection did not complete: %w", cerr)
+		}
+		if !options.allowNoBackends {
+			return nil, fmt.Errorf("no network configuration backend detected: address changes would apply to the running system but not survive a reboot (use WithAllowNoBackends to proceed anyway)")
+		}
+	}
+
 	// Register the detected control panels in a stable apply order.
 	if _, serr := os.Stat(cpanelBin); serr == nil {
 		c.panelBackends = append(c.panelBackends, namedPanelBackend{"cPanel", new(cpanel)})
@@ -137,44 +149,63 @@ func NewConfigurator(opts ...Option) (configurator Configurator, err error) {
 		c.panelBackends = append(c.panelBackends, namedPanelBackend{"Interworx", new(interworx)})
 	}
 
-	// Detection failures are logged above; they are not fatal to constructing
-	// the configurator, so do not propagate them to the caller.
-	err = nil
-	return
+	// Detection failures are logged above; a backend that could not be parsed is
+	// skipped rather than propagated, so the configurator is returned without an
+	// error as long as at least one backend was registered.
+	return c, nil
 }
 
-// legacyActiveUnits detects active network managers on systems that lack a
-// usable systemd D-Bus interface, where ListUnits is unavailable: Upstart on
-// Ubuntu 14.04 and SysVinit/Upstart on CentOS 5/6. Detection is by config and
-// runtime presence rather than by querying any specific init system, so it is
-// init-agnostic and spawns no subprocesses.
-//
-// systemd-networkd cannot run on these systems, and ifupdown is detected
-// separately by config-file presence, so only the RHEL network-scripts service
-// and NetworkManager are considered here. The returned keys match the systemd
-// unit names used by the caller.
-func legacyActiveUnits() map[string]bool {
-	active := make(map[string]bool)
-
-	// RHEL-family network-scripts has no daemon; presence of its config
-	// directory is the best available signal that it manages the network.
-	if fi, serr := os.Stat(networkScriptsPath); serr == nil && fi.IsDir() {
-		active["network.service"] = true
+// ifUpDownDetected reports whether ifupdown manages this host's network.
+// /etc/network/interfaces existing is not enough on its own: it is left behind
+// on Ubuntu hosts migrated to netplan and on Debian hosts that have handed the
+// network to NetworkManager, so the networking service must also be running or
+// enabled. On a host with no discoverable init system there is nothing to
+// corroborate against, and the config file's presence is taken as sufficient
+// rather than dropping a backend that may well be the only one.
+func ifUpDownDetected(ctx context.Context, s *initState) bool {
+	if _, err := os.Stat(ifUpDownConfig); err != nil {
+		return false
 	}
+	return s.detected(ctx, "networking") || !initSystemDiscoverable()
+}
 
-	// NetworkManager manages the network via its own D-Bus interface; a
-	// runtime pid file indicates the daemon is running.
-	for _, pidFile := range []string{
-		"/var/run/NetworkManager/NetworkManager.pid",
-		"/run/NetworkManager/NetworkManager.pid",
-	} {
-		if _, serr := os.Stat(pidFile); serr == nil {
-			active["NetworkManager.service"] = true
-			break
-		}
+// linkIsUp reports whether a link can carry traffic. The operational state is
+// the honest answer where the driver reports one: an interface that is
+// administratively up but has no carrier — an unplugged cable — cannot. Many
+// virtual and paravirtual drivers never report an operational state at all, so
+// for those the administrative flag stands in.
+func linkIsUp(attrs *netlink.LinkAttrs) bool {
+	if attrs.OperState == netlink.OperUnknown {
+		return attrs.Flags&net.FlagUp != 0
 	}
+	return attrs.OperState == netlink.OperUp
+}
 
-	return active
+// ensureLinkUp brings an administratively down link up, reporting whether it
+// had to. The kernel installs an address's connected route only while its link
+// is up, so a gateway added to a down interface is rejected as unreachable and
+// the interface has to be raised before its addresses and routes are written.
+// Only the administrative flag is consulted, not the operational state that
+// linkIsUp prefers: a link that is up and waiting on carrier is already as up
+// as this can make it, and setting it up again would say nothing.
+func ensureLinkUp(h *netlink.Handle, link netlink.Link) (bool, error) {
+	if link.Attrs().Flags&net.FlagUp != 0 {
+		return false, nil
+	}
+	if err := h.LinkSetUp(link); err != nil {
+		return false, fmt.Errorf("failed to bring up interface %s: %w", link.Attrs().Name, err)
+	}
+	return true, nil
+}
+
+// linkIsPhysical reports whether a link is backed by a network device rather
+// than created by the kernel. rtnetlink names the kind of every software
+// device — bridge, bond, veth, vlan, tun, wireguard, dummy — and names no kind
+// at all for a driver-backed NIC, which is the "device" this compares against.
+// Paravirtual NICs (virtio, vmxnet, xen) are driver-backed and so count as
+// physical: a VM's only real NIC is still the one to configure.
+func linkIsPhysical(link netlink.Link) bool {
+	return link.Type() == "device"
 }
 
 // Get list of interfaces and their configs.
@@ -206,6 +237,8 @@ func (c *linuxConfigurator) GetInterfaces(ctx context.Context) (interfaces []*In
 		i.Name = link.Attrs().Name
 		i.MAC = link.Attrs().HardwareAddr
 		i.Link = link
+		i.Up = linkIsUp(link.Attrs())
+		i.Physical = linkIsPhysical(link)
 
 		// Add IP Addresses.
 		addrs, err := h.AddrList(link, netlink.FAMILY_ALL)
@@ -261,10 +294,11 @@ func (c *linuxConfigurator) GetInterfaces(ctx context.Context) (interfaces []*In
 		interfaces = append(interfaces, i)
 	}
 
-	// DNS servers and search domains are not exposed via netlink, so merge
-	// them in from the persisted backend configurations. This lets callers
-	// read back what SetDNS wrote via Interface.DNS and Interface.SearchDomains.
-	mergeDNSFromBackends(c.ifaceBackends, interfaces)
+	// DNS servers, search domains, and DHCP client state are not exposed via
+	// netlink, so merge them in from the persisted backend configurations. This
+	// lets callers read back what SetDNS and SetDHCP wrote via Interface.DNS,
+	// Interface.SearchDomains, Interface.DHCP4, and Interface.DHCP6.
+	mergeBackendState(c.ifaceBackends, interfaces)
 	return
 }
 
@@ -295,6 +329,26 @@ func (c *linuxConfigurator) AddAddress(ctx context.Context, iface string, addr *
 		if !addr.Contains(gateway) && !gateway.IsLinkLocalUnicast() {
 			return fmt.Errorf("provided gateway is not reachable from network")
 		}
+	}
+
+	// Raise the interface before writing to it. A down link carries no connected
+	// route for the address about to be added, so the gateway below would be
+	// rejected as unreachable. A link raised here is part of the pre-change state
+	// this restores, so put it back down on any path that does not complete.
+	broughtUp, err := ensureLinkUp(h, link)
+	if err != nil {
+		return err
+	}
+	applied := false
+	if broughtUp {
+		defer func() {
+			if applied {
+				return
+			}
+			if derr := h.LinkSetDown(link); derr != nil {
+				logger.Printf("failed to return interface %s to down: %v", iface, derr)
+			}
+		}()
 	}
 
 	// Get existing addresses and save the full pre-change state so we can
@@ -479,8 +533,14 @@ func (c *linuxConfigurator) AddAddress(ctx context.Context, iface string, addr *
 						return err
 					}
 				} else if addedGateway != nil {
+					// Deleting the address above takes with it every route that
+					// resolved its nexthop through the address's connected
+					// subnet, which is exactly how the gateway added here was
+					// reachable. The kernel then has nothing left to delete and
+					// answers ESRCH, so treat an already-gone route as removed
+					// rather than reporting it over the rollback's own error.
 					err = h.RouteDel(addedGateway)
-					if err != nil {
+					if err != nil && !errors.Is(err, syscall.ESRCH) {
 						return err
 					}
 				}
@@ -488,6 +548,9 @@ func (c *linuxConfigurator) AddAddress(ctx context.Context, iface string, addr *
 			}
 		}
 	}
+
+	// The runtime state now holds, so a link raised above stays up.
+	applied = true
 
 	// Update configuration files. Skip control panels when skipPanels is set.
 	applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
@@ -1014,5 +1077,21 @@ routeLoop:
 func (c *linuxConfigurator) SetDNS(ctx context.Context, iface string, servers []net.IP, searchDomains []string) error {
 	applyIfaceDNS(ctx, c.ifaceBackends, iface, servers, searchDomains)
 	applyLiveDNS(ctx, iface, servers, searchDomains)
+	return nil
+}
+
+// Enable or disable the DHCP client for each address family on an interface.
+func (c *linuxConfigurator) SetDHCP(ctx context.Context, iface string, dhcp4, dhcp6 bool) error {
+	if !applyIfaceDHCP(ctx, c.ifaceBackends, iface, dhcp4, dhcp6) {
+		return fmt.Errorf("no backend accepted a DHCP change for %s", iface)
+	}
+
+	// Enabling a client asks the running system to acquire a lease now. Turning
+	// one off does not reconfigure the interface: the existing lease is left to
+	// expire, so a caller connected over the leased address is not cut off by a
+	// call that was only meant to change what happens on the next boot.
+	if dhcp4 || dhcp6 {
+		renewDHCPOnBackends(ctx, c.ifaceBackends, iface)
+	}
 	return nil
 }

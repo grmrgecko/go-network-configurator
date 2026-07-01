@@ -65,6 +65,31 @@ type ciInterface struct {
 	Optional       bool           `yaml:"optional,omitempty" json:"optional,omitempty"`
 }
 
+// dhcpState reports whether each family's DHCP client is enabled. An absent key
+// means the schema default, which is off.
+func (c *ciInterface) dhcpState() (dhcp4, dhcp6 bool) {
+	return c.DHCP4 != nil && *c.DHCP4, c.DHCP6 != nil && *c.DHCP6
+}
+
+// setDHCP records the requested DHCP client state for both families, dropping
+// the overrides of a family whose client is being turned off. A family being
+// disabled that was already absent stays absent rather than being written out
+// as false.
+func (c *ciInterface) setDHCP(dhcp4, dhcp6 bool) {
+	if dhcp4 || c.DHCP4 != nil {
+		c.DHCP4 = boolPtr(dhcp4)
+	}
+	if !dhcp4 {
+		c.DHCP4Overrides = nil
+	}
+	if dhcp6 || c.DHCP6 != nil {
+		c.DHCP6 = boolPtr(dhcp6)
+	}
+	if !dhcp6 {
+		c.DHCP6Overrides = nil
+	}
+}
+
 // Physical ethernet interface.
 type ciEthernet struct {
 	ciPhysical  `yaml:",inline" json:",inline"`
@@ -375,6 +400,7 @@ func (*cloudInit) ConvertInterface(name string, MAC string, config ciInterface, 
 	i.Name = name
 	i.MAC = mac
 	i.Link = foundLink
+	i.DHCP4, i.DHCP6 = config.dhcpState()
 
 	// Parse addresses.
 	for _, addr := range config.Addresses {
@@ -473,6 +499,15 @@ func (ci *cloudInit) GetInterfaces() (interfaces []*Interface, err error) {
 
 		// Parse subnet configs.
 		for _, subnet := range config.Subnets {
+			// A v1 subnet encodes the DHCP client in its type rather than in a
+			// dhcp4/dhcp6 key. "dhcp" with no suffix is the IPv4 client.
+			switch subnet.Type {
+			case "dhcp", "dhcp4":
+				i.DHCP4 = true
+			case "dhcp6", "ipv6_dhcpv6-stateful", "ipv6_dhcpv6-stateless":
+				i.DHCP6 = true
+			}
+
 			// Add DNS servers and search domains.
 			for _, dns := range subnet.DNSNameservers {
 				if ip := net.ParseIP(dns); ip != nil {
@@ -1017,6 +1052,89 @@ func (ci *cloudInit) SetIfaceAddresses(_ context.Context, iface string, addrs []
 			}
 			ci.Network.VLANs[iface] = config
 		}
+	}
+
+	// Try to save changes.
+	err = ci.Save()
+	return
+}
+
+// ciDHCPSubnetTypes are the v1 subnet types that describe a DHCP client rather
+// than a static address, keyed by whether they are removed when that family's
+// client is disabled.
+var ciDHCPSubnetTypes = map[string]bool{
+	"dhcp":                  true, // IPv4, the unsuffixed spelling.
+	"dhcp4":                 true,
+	"dhcp6":                 false,
+	"ipv6_dhcpv6-stateful":  false,
+	"ipv6_dhcpv6-stateless": false,
+}
+
+// Set the DHCP client state on an interface.
+func (ci *cloudInit) SetIfaceDHCP(_ context.Context, iface string, dhcp4, dhcp6 bool) (err error) {
+	// Apply changes to v1 configs, where the DHCP client is a subnet whose type
+	// names it rather than a key. Static subnets are left in place: cloud-init
+	// accepts a dhcp subnet and a static subnet on the same interface.
+	for c, config := range ci.Network.Configs {
+		switch config.Type {
+		case "physical", "bond", "bridge", "vlan":
+		default:
+			continue
+		}
+		if config.Name != iface {
+			continue
+		}
+
+		// Drop the existing DHCP subnets of both families, then re-add the ones
+		// that were asked for. Rebuilding rather than editing in place keeps a
+		// config that listed several spellings of the same client from ending up
+		// with a stale one alongside the new one.
+		subnets := make([]ciSubnet, 0, len(config.Subnets)+2)
+		if dhcp4 {
+			subnets = append(subnets, ciSubnet{Type: "dhcp4"})
+		}
+		if dhcp6 {
+			subnets = append(subnets, ciSubnet{Type: "dhcp6"})
+		}
+		for _, subnet := range config.Subnets {
+			if _, isDHCP := ciDHCPSubnetTypes[subnet.Type]; isDHCP {
+				continue
+			}
+			subnets = append(subnets, subnet)
+		}
+		config.Subnets = subnets
+		ci.Network.Configs[c] = config
+	}
+
+	// Apply changes to v2 ethernets.
+	for name, config := range ci.Network.Ethernets {
+		ifName := name
+		if config.SetName != "" {
+			ifName = config.SetName
+		}
+		if ifName != iface {
+			continue
+		}
+		config.setDHCP(dhcp4, dhcp6)
+		ci.Network.Ethernets[name] = config
+	}
+
+	// Apply changes to v2 bridges.
+	if config, ok := ci.Network.Bridges[iface]; ok {
+		config.setDHCP(dhcp4, dhcp6)
+		ci.Network.Bridges[iface] = config
+	}
+
+	// Apply changes to v2 bonds.
+	if config, ok := ci.Network.Bonds[iface]; ok {
+		config.setDHCP(dhcp4, dhcp6)
+		ci.Network.Bonds[iface] = config
+	}
+
+	// Apply changes to v2 VLAN interfaces.
+	if config, ok := ci.Network.VLANs[iface]; ok {
+		config.setDHCP(dhcp4, dhcp6)
+		ci.Network.VLANs[iface] = config
 	}
 
 	// Try to save changes.

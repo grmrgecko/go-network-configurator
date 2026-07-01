@@ -38,6 +38,96 @@ type ifUpDown struct {
 	backupRetention int
 }
 
+// stanzaFamily reports the address family this interface's stanza configures.
+// "iface eth0 inet dhcp" configures IPv4, "iface eth0 inet6 static" IPv6. An
+// interface this backend has not seen has no stanza and reports "".
+func (iface *ifInterface) stanzaFamily() string {
+	fields := strings.Fields(iface.Mode)
+	if len(fields) == 0 {
+		return ""
+	}
+	switch fields[0] {
+	case "inet", "inet6":
+		return fields[0]
+	}
+	return ""
+}
+
+// dhcpState reports whether each family's DHCP client is enabled. A stanza only
+// ever configures one family, so at most one of these is ever true.
+func (iface *ifInterface) dhcpState() (dhcp4, dhcp6 bool) {
+	if !iface.isDHCP {
+		return false, false
+	}
+	family := iface.stanzaFamily()
+	return family == "inet", family == "inet6"
+}
+
+// setDHCP switches the stanza's method between "dhcp" and "static" for the
+// family the stanza configures.
+//
+// Unlike netplan or networkd, an ifupdown interface is a set of stanzas and
+// each names exactly one family, so this backend cannot express "DHCPv4 on,
+// DHCPv6 on" from the single stanza it tracks per interface. Asking it to
+// enable DHCP for the family its stanza does not configure is therefore an
+// error rather than a silent no-op — the caller would otherwise be told the
+// request succeeded while nothing was written. Disabling that other family is
+// already true of a stanza that never configured it, so it is accepted.
+func (iface *ifInterface) setDHCP(dhcp4, dhcp6 bool) error {
+	if iface.isPPP {
+		return fmt.Errorf("cannot change DHCP on PPP interface")
+	}
+
+	// An interface with no stanza yet gets one for the family being enabled.
+	family := iface.stanzaFamily()
+	if family == "" {
+		switch {
+		case dhcp4 && dhcp6:
+			return fmt.Errorf("ifupdown cannot enable DHCP for both families on one stanza")
+		case dhcp4:
+			iface.Mode = "inet dhcp"
+			iface.isDHCP = true
+		case dhcp6:
+			iface.Mode = "inet6 dhcp"
+			iface.isDHCP = true
+		default:
+			iface.Mode = "inet static"
+			iface.isDHCP = false
+		}
+		return nil
+	}
+
+	// Split the request into the family this stanza speaks for and the one it
+	// does not. Only the former can be honored.
+	enable, other := dhcp4, dhcp6
+	if family == "inet6" {
+		enable, other = dhcp6, dhcp4
+	}
+	if other {
+		return fmt.Errorf("ifupdown cannot enable DHCP for the other family on an %q stanza for %s", family, iface.Name)
+	}
+
+	fields := strings.Fields(iface.Mode)
+	method := ""
+	if len(fields) > 1 {
+		method = fields[1]
+	}
+	switch method {
+	case "loopback", "ppp", "tunnel", "wvdial":
+		return fmt.Errorf("cannot change DHCP on %q interface %s", method, iface.Name)
+	}
+
+	switch {
+	case enable && method != "dhcp":
+		iface.Mode = family + " dhcp"
+		iface.isDHCP = true
+	case !enable && method == "dhcp":
+		iface.Mode = family + " static"
+		iface.isDHCP = false
+	}
+	return nil
+}
+
 // Either retreives an existing interface, or makes a new one.
 func (i *ifUpDown) EnsureInterface(name string) *ifInterface {
 	// Find existing interface and return it.
@@ -637,6 +727,7 @@ func (i *ifUpDown) GetInterfaces() (interfaces []*Interface, err error) {
 	for _, iface := range i.Interfaces {
 		i := new(Interface)
 		i.Name = iface.Name
+		i.DHCP4, i.DHCP6 = iface.dhcpState()
 
 		// Discover the interface name and mac address.
 		for _, link := range links {
@@ -983,6 +1074,41 @@ func (iface *ifInterface) Save(backupDir string, backupRetention int) error {
 	return nil
 }
 
+// Set the DHCP client state on an interface.
+func (i *ifUpDown) SetIfaceDHCP(_ context.Context, iface string, dhcp4, dhcp6 bool) (err error) {
+	// Find or create the interface. A backend must not silently no-op just
+	// because it has not seen this interface before (e.g. a freshly attached
+	// NIC), otherwise the caller gets a success with no persisted change.
+	ifc := i.EnsureInterface(iface)
+
+	// Switching to DHCP hands addressing to the lease, so the static addresses
+	// and gateways the stanza carried are dropped rather than written back
+	// under a "dhcp" method that has no address option to hold them.
+	dhcp := dhcp4 || dhcp6
+	if err = ifc.setDHCP(dhcp4, dhcp6); err != nil {
+		return err
+	}
+	if dhcp {
+		ifc.Addresses = nil
+		ifc.Gateway4 = nil
+		ifc.Gateway6 = nil
+	}
+
+	// Save the interface config.
+	return ifc.Save(i.BackupDir, i.backupRetention)
+}
+
+// renewDHCP restarts the interface through ifupdown so the "dhcp" method that
+// was just written to its stanza is acted on and a lease is acquired. ifup on
+// an already-up interface is a no-op, so it is taken down first.
+func (i *ifUpDown) renewDHCP(ctx context.Context, iface string) error {
+	// ifdown on an interface that is already down exits non-zero, which is not
+	// a failure of this call — down is the state ifup wants it in.
+	_, _ = runCommand(ctx, "ifdown", iface)
+	_, err := runCommand(ctx, "ifup", iface)
+	return err
+}
+
 // Set addresses to interface.
 func (i *ifUpDown) SetIfaceAddresses(_ context.Context, iface string, addrs []*net.IPNet, gateway4, gateway6 net.IP) (err error) {
 	// Find the interface.
@@ -991,7 +1117,10 @@ func (i *ifUpDown) SetIfaceAddresses(_ context.Context, iface string, addrs []*n
 			continue
 		}
 
-		// Ensure we can adjust addresses.
+		// Ensure we can adjust addresses. An ifupdown "dhcp" stanza takes no
+		// address option, so unlike netplan or networkd this backend cannot
+		// carry a static address alongside a lease on the same stanza. Call
+		// SetIfaceDHCP to convert the stanza to static first.
 		if ifc.isDHCP {
 			return fmt.Errorf("cannot change addresses on DHCP interface")
 		} else if ifc.isPPP {

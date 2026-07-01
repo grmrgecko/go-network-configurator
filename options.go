@@ -20,6 +20,10 @@ const (
 	// defaultBackupRetention is how many .bak.* copies are kept per original
 	// configuration file. Older backups beyond this number are pruned on save.
 	defaultBackupRetention = 5
+	// defaultServiceReadyTimeout bounds how long NewConfigurator waits for a
+	// backend's daemon to come up and finish starting. It only elapses in full
+	// on a host where the service is registered to run but never arrives.
+	defaultServiceReadyTimeout = 60 * time.Second
 )
 
 // Logger is the minimal logging surface used across the package. It is
@@ -72,6 +76,14 @@ type configOptions struct {
 	// (cPanel/Plesk/InterWorx) and only remove the address from the running
 	// system and the network-manager configuration files.
 	skipPanels bool
+	// allowNoBackends lets NewConfigurator succeed on a Linux host where no
+	// network configuration backend was detected, where changes would otherwise
+	// apply to the running system without persisting.
+	allowNoBackends bool
+	// serviceReadyTimeout bounds how long backend detection waits for a
+	// daemon-backed backend (NetworkManager) to become ready; <= 0 does not
+	// wait at all.
+	serviceReadyTimeout time.Duration
 }
 
 // defaultConfigOptions returns the options used when no Option is supplied.
@@ -82,6 +94,7 @@ func defaultConfigOptions() *configOptions {
 		pingCount:           defaultPingCount,
 		pingTimeout:         defaultPingTimeout,
 		backupRetention:     defaultBackupRetention,
+		serviceReadyTimeout: defaultServiceReadyTimeout,
 	}
 }
 
@@ -191,5 +204,39 @@ func WithAllowPrimaryRemoval(allowed bool) Option {
 func WithSkipPanels(skip bool) Option {
 	return func(o *configOptions) {
 		o.skipPanels = skip
+	}
+}
+
+// WithAllowNoBackends lets NewConfigurator return a configurator on a Linux
+// host where backend detection found no network configuration backend. By
+// default that is an error: netlink would apply an address change to the
+// running system, but with nothing to write it to the change would not survive
+// a reboot, and the caller would never be told. Enable this when the
+// configurator is only used to read state (GetInterfaces), or when the caller
+// accepts runtime-only changes.
+func WithAllowNoBackends(allowed bool) Option {
+	return func(o *configOptions) {
+		o.allowNoBackends = allowed
+	}
+}
+
+// WithServiceReadyTimeout bounds how long NewConfigurator waits for a backend
+// whose configuration is made through a daemon rather than a file. Today that
+// is NetworkManager: it is configured over D-Bus, so a configurator built
+// before the daemon owns its bus name would find no connections to change.
+//
+// This matters at boot. A host that starts this program from a unit ordered
+// alongside NetworkManager, rather than after it, reaches backend detection
+// while the daemon is still starting; without the wait it would either fail to
+// register the backend at all, or register one that reports an empty interface
+// list. The wait ends as soon as the daemon answers and reports it has finished
+// starting up, so a host where it is already running pays nothing.
+//
+// A timeout of zero or less does not wait: detection probes once and proceeds,
+// which is the right choice for a caller that has already ordered itself after
+// the daemon and would rather fail fast than block.
+func WithServiceReadyTimeout(timeout time.Duration) Option {
+	return func(o *configOptions) {
+		o.serviceReadyTimeout = timeout
 	}
 }

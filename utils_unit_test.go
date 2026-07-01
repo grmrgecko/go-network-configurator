@@ -6,10 +6,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
 
@@ -19,17 +20,11 @@ func TestIP2UintRoundTrip(t *testing.T) {
 	cases := []string{"0.0.0.0", "1.2.3.4", "192.168.1.255", "255.255.255.255"}
 	for _, c := range cases {
 		ip := net.ParseIP(c)
-		if ip == nil {
-			t.Fatalf("could not parse %q", c)
-		}
+		require.NotNil(t, ip, "could not parse %q", c)
 		got := uint2IP(ip2Uint(ip))
-		if !got.Equal(ip) {
-			t.Errorf("round trip of %s: got %s", c, got)
-		}
+		assert.True(t, got.Equal(ip), "round trip of %s: got %s", c, got)
 		// uint2IP should produce the canonical four-byte representation.
-		if len(got) != net.IPv4len {
-			t.Errorf("uint2IP(%s) length = %d, want %d", c, len(got), net.IPv4len)
-		}
+		assert.Equal(t, net.IPv4len, len(got), "uint2IP(%s) length", c)
 	}
 }
 
@@ -38,13 +33,9 @@ func TestIP2UintRoundTrip(t *testing.T) {
 func TestIP2UintAcceptsBothRepresentations(t *testing.T) {
 	ip16 := net.ParseIP("10.20.30.40")
 	ip4 := ip16.To4()
-	if ip4 == nil {
-		t.Fatal("expected an IPv4 address")
-	}
-	if ip2Uint(ip16) != ip2Uint(ip4) {
-		t.Errorf("ip2Uint disagrees for 16-byte (%d) and 4-byte (%d) forms",
-			ip2Uint(ip16), ip2Uint(ip4))
-	}
+	require.NotNil(t, ip4, "expected an IPv4 address")
+	assert.Equal(t, ip2Uint(ip16), ip2Uint(ip4),
+		"ip2Uint disagrees for 16-byte and 4-byte forms")
 }
 
 func TestAllFF(t *testing.T) {
@@ -60,9 +51,7 @@ func TestAllFF(t *testing.T) {
 		{[]byte{0xff, 0xff, 0xfe}, false},
 	}
 	for _, c := range cases {
-		if got := allFF(c.in); got != c.want {
-			t.Errorf("allFF(%v) = %v, want %v", c.in, got, c.want)
-		}
+		assert.Equal(t, c.want, allFF(c.in), "allFF(%v)", c.in)
 	}
 }
 
@@ -79,14 +68,10 @@ func TestGetBroadcast(t *testing.T) {
 	}
 	for _, c := range cases {
 		_, network, err := net.ParseCIDR(c.cidr)
-		if err != nil {
-			t.Fatalf("ParseCIDR(%q): %v", c.cidr, err)
-		}
+		require.NoError(t, err, "ParseCIDR(%q)", c.cidr)
 		got := getBroadcast(network)
 		want := net.ParseIP(c.want)
-		if !got.Equal(want) {
-			t.Errorf("getBroadcast(%s) = %s, want %s", c.cidr, got, c.want)
-		}
+		assert.True(t, got.Equal(want), "getBroadcast(%s) = %s, want %s", c.cidr, got, c.want)
 	}
 }
 
@@ -98,243 +83,193 @@ func TestGetBroadcastMixedFamily(t *testing.T) {
 		Mask: net.CIDRMask(96+24, 128), // /24 expressed as a 16-byte mask.
 	}
 	got := getBroadcast(network)
-	if want := net.ParseIP("192.168.1.255"); !got.Equal(want) {
-		t.Errorf("getBroadcast mixed family = %s, want %s", got, want)
-	}
+	want := net.ParseIP("192.168.1.255")
+	assert.True(t, got.Equal(want), "getBroadcast mixed family = %s, want %s", got, want)
 }
 
 func TestSortableDirEntries(t *testing.T) {
 	dir := t.TempDir()
 	names := []string{"zebra", "alpha", "mike", "bravo"}
 	for _, n := range names {
-		if err := os.WriteFile(filepath.Join(dir, n), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(filepath.Join(dir, n), nil, 0o644))
 	}
 	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// Shuffle into a known unsorted order before sorting.
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() > entries[j].Name()
 	})
 
 	sortable := sortableDirEntries(entries)
-	if sortable.Len() != len(names) {
-		t.Errorf("Len() = %d, want %d", sortable.Len(), len(names))
-	}
+	assert.Equal(t, len(names), sortable.Len(), "Len()")
 	sort.Sort(sortable)
 
 	want := []string{"alpha", "bravo", "mike", "zebra"}
 	for i, w := range want {
-		if entries[i].Name() != w {
-			t.Errorf("sorted[%d] = %s, want %s", i, entries[i].Name(), w)
-		}
+		assert.Equal(t, w, entries[i].Name(), "sorted[%d]", i)
 	}
 }
 
 func TestIntStringYAML(t *testing.T) {
 	t.Run("int", func(t *testing.T) {
 		var v intString
-		if err := yaml.Unmarshal([]byte("42\n"), &v); err != nil {
-			t.Fatal(err)
-		}
-		if v.Int == nil || *v.Int != 42 {
-			t.Fatalf("Int = %v, want 42", v.Int)
-		}
-		if v.String != nil {
-			t.Errorf("String should be nil, got %v", *v.String)
-		}
+		require.NoError(t, yaml.Unmarshal([]byte("42\n"), &v))
+		require.NotNil(t, v.Int, "Int = %v, want 42", v.Int)
+		assert.Equal(t, 42, *v.Int)
+		assert.Nil(t, v.String, "String should be nil")
 		out, err := yaml.Marshal(v)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := string(out); got != "42\n" {
-			t.Errorf("marshal = %q, want %q", got, "42\n")
-		}
+		require.NoError(t, err)
+		assert.Equal(t, "42\n", string(out), "marshal")
 	})
 
 	t.Run("string", func(t *testing.T) {
 		var v intString
-		if err := yaml.Unmarshal([]byte("auto\n"), &v); err != nil {
-			t.Fatal(err)
-		}
-		if v.String == nil || *v.String != "auto" {
-			t.Fatalf("String = %v, want auto", v.String)
-		}
-		if v.Int != nil {
-			t.Errorf("Int should be nil, got %v", *v.Int)
-		}
+		require.NoError(t, yaml.Unmarshal([]byte("auto\n"), &v))
+		require.NotNil(t, v.String, "String = %v, want auto", v.String)
+		assert.Equal(t, "auto", *v.String)
+		assert.Nil(t, v.Int, "Int should be nil")
 		out, err := yaml.Marshal(v)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := string(out); got != "auto\n" {
-			t.Errorf("marshal = %q, want %q", got, "auto\n")
-		}
+		require.NoError(t, err)
+		assert.Equal(t, "auto\n", string(out), "marshal")
 	})
 
 	t.Run("empty marshals to null", func(t *testing.T) {
 		out, err := yaml.Marshal(intString{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := string(out); got != "null\n" {
-			t.Errorf("marshal of empty = %q, want %q", got, "null\n")
-		}
+		require.NoError(t, err)
+		assert.Equal(t, "null\n", string(out), "marshal of empty")
 	})
 }
 
 func TestIntStringJSON(t *testing.T) {
 	t.Run("int", func(t *testing.T) {
 		var v intString
-		if err := json.Unmarshal([]byte("42"), &v); err != nil {
-			t.Fatal(err)
-		}
-		if v.Int == nil || *v.Int != 42 {
-			t.Fatalf("Int = %v, want 42", v.Int)
-		}
+		require.NoError(t, json.Unmarshal([]byte("42"), &v))
+		require.NotNil(t, v.Int, "Int = %v, want 42", v.Int)
+		assert.Equal(t, 42, *v.Int)
 		out, err := json.Marshal(v)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := string(out); got != "42" {
-			t.Errorf("marshal = %q, want %q", got, "42")
-		}
+		require.NoError(t, err)
+		assert.Equal(t, "42", string(out), "marshal")
 	})
 
 	t.Run("string", func(t *testing.T) {
 		var v intString
-		if err := json.Unmarshal([]byte(`"auto"`), &v); err != nil {
-			t.Fatal(err)
-		}
-		if v.String == nil || *v.String != "auto" {
-			t.Fatalf("String = %v, want auto", v.String)
-		}
+		require.NoError(t, json.Unmarshal([]byte(`"auto"`), &v))
+		require.NotNil(t, v.String, "String = %v, want auto", v.String)
+		assert.Equal(t, "auto", *v.String)
 		out, err := json.Marshal(v)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := string(out); got != `"auto"` {
-			t.Errorf("marshal = %q, want %q", got, `"auto"`)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, `"auto"`, string(out), "marshal")
 	})
 
 	t.Run("invalid", func(t *testing.T) {
 		var v intString
-		if err := json.Unmarshal([]byte("{}"), &v); err == nil {
-			t.Error("expected error for object input, got nil")
-		}
+		err := json.Unmarshal([]byte("{}"), &v)
+		assert.Error(t, err, "expected error for object input, got nil")
 	})
 }
 
 func TestRunCommand(t *testing.T) {
 	t.Run("stdout", func(t *testing.T) {
 		out, err := runCommand(context.Background(), "printf", "line1\nline2\n")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		require.NoError(t, err, "unexpected error")
 		want := []string{"line1", "line2"}
-		if !reflect.DeepEqual(out, want) {
-			t.Errorf("out = %v, want %v", out, want)
-		}
+		assert.Equal(t, want, out, "out")
 	})
 
 	t.Run("nonzero exit", func(t *testing.T) {
 		_, err := runCommand(context.Background(), "false")
-		if err == nil {
-			t.Error("expected error for failing command, got nil")
-		}
+		assert.Error(t, err, "expected error for failing command, got nil")
 	})
 
 	t.Run("missing binary", func(t *testing.T) {
 		_, err := runCommand(context.Background(), "this-binary-should-not-exist-12345")
-		if err == nil {
-			t.Error("expected error for missing binary, got nil")
-		}
+		assert.Error(t, err, "expected error for missing binary, got nil")
 	})
 }
 
 func TestTestInternet(t *testing.T) {
-	if !testInternet(context.Background(), "test_success", 0) {
-		t.Error("test_success sentinel should report success")
-	}
-	if testInternet(context.Background(), "test_fail", 0) {
-		t.Error("test_fail sentinel should report failure")
-	}
+	assert.True(t, testInternet(context.Background(), "test_success", 0),
+		"test_success sentinel should report success")
+	assert.False(t, testInternet(context.Background(), "test_fail", 0),
+		"test_fail sentinel should report failure")
 }
 
 func TestFileCopyAndMove(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.txt")
 	content := []byte("hello world\n")
-	if err := os.WriteFile(src, content, 0o640); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(src, content, 0o640))
 
 	t.Run("fileCopy preserves contents and mode", func(t *testing.T) {
 		dst := filepath.Join(dir, "copy.txt")
-		if err := fileCopy(src, dst); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, fileCopy(src, dst))
 		got, err := os.ReadFile(dst)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(got, content) {
-			t.Errorf("copied contents = %q, want %q", got, content)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, content, got, "copied contents")
 		fi, err := os.Stat(dst)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if fi.Mode().Perm() != 0o640 {
-			t.Errorf("copied mode = %v, want 0640", fi.Mode().Perm())
-		}
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o640), fi.Mode().Perm(), "copied mode")
 	})
 
 	t.Run("fileCopy missing source errors", func(t *testing.T) {
-		if err := fileCopy(filepath.Join(dir, "nope"), filepath.Join(dir, "out")); err == nil {
-			t.Error("expected error for missing source")
-		}
+		err := fileCopy(filepath.Join(dir, "nope"), filepath.Join(dir, "out"))
+		assert.Error(t, err, "expected error for missing source")
 	})
 
 	t.Run("fileMoveCopy removes source", func(t *testing.T) {
 		moveSrc := filepath.Join(dir, "movesrc.txt")
-		if err := os.WriteFile(moveSrc, content, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(moveSrc, content, 0o644))
 		dst := filepath.Join(dir, "moved.txt")
-		if err := fileMoveCopy(moveSrc, dst); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := os.Stat(moveSrc); !os.IsNotExist(err) {
-			t.Errorf("source should be gone, stat err = %v", err)
-		}
+		require.NoError(t, fileMoveCopy(moveSrc, dst))
+		_, err := os.Stat(moveSrc)
+		assert.True(t, os.IsNotExist(err), "source should be gone, stat err = %v", err)
 		got, err := os.ReadFile(dst)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(got, content) {
-			t.Errorf("moved contents = %q, want %q", got, content)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, content, got, "moved contents")
 	})
 
 	t.Run("fileMove same device renames", func(t *testing.T) {
 		moveSrc := filepath.Join(dir, "rename-src.txt")
-		if err := os.WriteFile(moveSrc, content, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(moveSrc, content, 0o644))
 		dst := filepath.Join(dir, "renamed.txt")
-		if err := fileMove(moveSrc, dst); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := os.Stat(moveSrc); !os.IsNotExist(err) {
-			t.Errorf("source should be gone after move, stat err = %v", err)
-		}
-		if _, err := os.Stat(dst); err != nil {
-			t.Errorf("destination missing after move: %v", err)
-		}
+		require.NoError(t, fileMove(moveSrc, dst))
+		_, err := os.Stat(moveSrc)
+		assert.True(t, os.IsNotExist(err), "source should be gone after move, stat err = %v", err)
+		_, err = os.Stat(dst)
+		assert.NoError(t, err, "destination missing after move")
 	})
+}
+
+func TestNaturalLess(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+		why  string
+	}{
+		{"eth2", "eth10", true, "digit runs compare by value, not character"},
+		{"eth10", "eth2", false, "reversed"},
+		{"eth0", "eth1", true, "same width digits"},
+		{"enp0s3", "enp0s10", true, "embedded digit runs"},
+		{"eth0", "eth0", false, "equal strings are not less"},
+		{"eth", "eth0", true, "a prefix sorts before what extends it"},
+		{"eth0", "eth", false, "reversed prefix"},
+		{"eth007", "eth7", false, "leading zeros do not change the value"},
+		{"eth7", "eth007", false, "reversed equal values"},
+		{"eth1", "wlan0", true, "letters compare by byte"},
+		{"9", "10", true, "bare numbers"},
+		{"eth99999999999999999999", "eth999999999999999999999", true, "digit runs too long to parse"},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, naturalLess(c.a, c.b), "naturalLess(%q, %q): %s", c.a, c.b, c.why)
+	}
+}
+
+func TestLeadingDigits(t *testing.T) {
+	digits, rest := leadingDigits("10s3")
+	assert.Equal(t, "10", digits)
+	assert.Equal(t, "s3", rest)
+
+	digits, rest = leadingDigits("eth0")
+	assert.Empty(t, digits)
+	assert.Equal(t, "eth0", rest)
 }

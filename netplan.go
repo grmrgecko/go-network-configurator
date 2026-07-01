@@ -94,6 +94,32 @@ type npInterface struct {
 	OVSParameters *map[string]interface{} `yaml:"openvswitch,omitempty"`
 }
 
+// dhcpState reports whether each family's DHCP client is enabled. An absent
+// key means netplan's default, which is off.
+func (c *npInterface) dhcpState() (dhcp4, dhcp6 bool) {
+	return c.DHCP4 != nil && *c.DHCP4, c.DHCP6 != nil && *c.DHCP6
+}
+
+// setDHCP records the requested DHCP client state for both families. Disabling
+// a family drops its dhcp4-overrides/dhcp6-overrides, which netplan only reads
+// while that client runs. A family being disabled that was already absent is
+// left absent rather than written out as false, so reading and rewriting a
+// config that never mentioned DHCP does not churn it.
+func (c *npInterface) setDHCP(dhcp4, dhcp6 bool) {
+	if dhcp4 || c.DHCP4 != nil {
+		c.DHCP4 = boolPtr(dhcp4)
+	}
+	if !dhcp4 {
+		c.DHCP4Overrides = nil
+	}
+	if dhcp6 || c.DHCP6 != nil {
+		c.DHCP6 = boolPtr(dhcp6)
+	}
+	if !dhcp6 {
+		c.DHCP6Overrides = nil
+	}
+}
+
 // Physical ethernet configurations.
 type npEthernet struct {
 	npPhysical  `yaml:",inline"`
@@ -198,10 +224,12 @@ type netplan struct {
 	backupRetention int
 }
 
-// Verify netplan exists, and try parsing its configurations.
-func newNetplan(backupRetention int) (np *netplan, err error) {
-	// Calling netplan info will verify netplan is on the machine.
-	_, err = runCommand(context.Background(), "netplan", "info")
+// Verify netplan exists, and try parsing its configurations. The `netplan info`
+// probe is bound to ctx so a wedged netplan cannot stall construction.
+func newNetplan(ctx context.Context, backupRetention int) (np *netplan, err error) {
+	// Calling netplan info will verify netplan is on the machine and working,
+	// not merely installed.
+	_, err = runCommand(ctx, "netplan", "info")
 	if err != nil {
 		return
 	}
@@ -408,6 +436,7 @@ func (*netplan) ConvertInterface(name string, config npInterface, links []netlin
 	i.Name = name
 	i.MAC = mac
 	i.Link = foundLink
+	i.DHCP4, i.DHCP6 = config.dhcpState()
 
 	// Parse addresses.
 	for _, addr := range config.Addresses {
@@ -806,6 +835,79 @@ func (np *netplan) SetIfaceAddresses(_ context.Context, iface string, addrs []*n
 	// Try to save changes.
 	err = np.Save()
 	return
+}
+
+// Set the DHCP client state on an interface.
+func (np *netplan) SetIfaceDHCP(_ context.Context, iface string, dhcp4, dhcp6 bool) (err error) {
+	// Update each config.
+	for _, c := range np.configs {
+		if c.empty {
+			continue
+		}
+
+		// Check ethernet interfaces.
+		for name, config := range c.Network.Ethernets {
+			// If the name is being changed in the config, use that as the name.
+			ifName := name
+			if config.SetName != "" {
+				ifName = config.SetName
+			}
+			if ifName != iface {
+				continue
+			}
+			c.dirty = true
+			config.setDHCP(dhcp4, dhcp6)
+			c.Network.Ethernets[name] = config
+		}
+
+		// Check Wifi interfaces.
+		for name, config := range c.Network.Wifis {
+			ifName := name
+			if config.SetName != "" {
+				ifName = config.SetName
+			}
+			if ifName != iface {
+				continue
+			}
+			c.dirty = true
+			config.setDHCP(dhcp4, dhcp6)
+			c.Network.Wifis[name] = config
+		}
+
+		// Check bridges.
+		if config, ok := c.Network.Bridges[iface]; ok {
+			c.dirty = true
+			config.setDHCP(dhcp4, dhcp6)
+			c.Network.Bridges[iface] = config
+		}
+
+		// Check bonds.
+		if config, ok := c.Network.Bonds[iface]; ok {
+			c.dirty = true
+			config.setDHCP(dhcp4, dhcp6)
+			c.Network.Bonds[iface] = config
+		}
+
+		// Check VLAN interfaces.
+		if config, ok := c.Network.VLANs[iface]; ok {
+			c.dirty = true
+			config.setDHCP(dhcp4, dhcp6)
+			c.Network.VLANs[iface] = config
+		}
+	}
+
+	// Try to save changes.
+	err = np.Save()
+	return
+}
+
+// renewDHCP makes netplan realize the configuration that was just written, so a
+// newly enabled DHCP client starts and acquires a lease. `netplan apply` is the
+// only supported way in; it reconciles every interface, not just this one, and
+// so is a no-op for the interfaces whose configuration did not change.
+func (np *netplan) renewDHCP(ctx context.Context, _ string) error {
+	_, err := runCommand(ctx, "netplan", "apply")
+	return err
 }
 
 // Set static routes to interface.

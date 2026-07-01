@@ -31,6 +31,56 @@ type networkd struct {
 	backupRetention int
 }
 
+// parseNetworkdDHCP reports which families a [Network] DHCP= value enables.
+// systemd.network(5) documents "yes", "no", "ipv4" and "ipv6"; the boolean
+// spellings and the pre-v243 aliases "both"/"none" are still accepted by
+// systemd and still appear in configs written by older tooling, so they are
+// recognised here too. An unset or unrecognised value enables nothing.
+func parseNetworkdDHCP(value string) (dhcp4, dhcp6 bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "yes", "true", "on", "1", "both":
+		return true, true
+	case "ipv4", "v4":
+		return true, false
+	case "ipv6", "v6":
+		return false, true
+	}
+	return false, false
+}
+
+// formatNetworkdDHCP renders the families back into a DHCP= value, returning
+// false when no family is left and the key should be removed rather than
+// written as "no". systemd already defaults DHCP= to no.
+func formatNetworkdDHCP(dhcp4, dhcp6 bool) (string, bool) {
+	switch {
+	case dhcp4 && dhcp6:
+		return "yes", true
+	case dhcp4:
+		return "ipv4", true
+	case dhcp6:
+		return "ipv6", true
+	}
+	return "", false
+}
+
+// setNetworkdDHCP rewrites the [Network] DHCP= key to request a lease for
+// exactly the requested families. With neither family enabled the key is
+// removed rather than written as "no": systemd already defaults DHCP= to no,
+// and a config that never mentioned DHCP should not grow the key.
+func setNetworkdDHCP(sec *ini.Section, dhcp4, dhcp6 bool) (err error) {
+	value, keep := formatNetworkdDHCP(dhcp4, dhcp6)
+	if !keep {
+		sec.DeleteKey("DHCP")
+		return nil
+	}
+	if key, kerr := sec.GetKey("DHCP"); kerr == nil {
+		key.SetValue(value)
+		return nil
+	}
+	_, err = sec.NewKey("DHCP", value)
+	return err
+}
+
 // Verify try parsing networkd configurations.
 func newNetworkd(backupRetention int) (n *networkd, err error) {
 	// Try to parse the networkd configurations. /etc/systemd/network is the
@@ -222,6 +272,13 @@ func (nd *networkd) GetInterfaces() (interfaces []*Interface, err error) {
 			switch sec.Name() {
 			// IF this is an network section, try to find addresses.
 			case "Network":
+				// Read the DHCP client state before the Address lookup below,
+				// which bails out of this section when no address is set — a
+				// DHCP-only network has exactly that shape.
+				if dhcpKey, _ := sec.GetKey("DHCP"); dhcpKey != nil {
+					i.DHCP4, i.DHCP6 = parseNetworkdDHCP(dhcpKey.String())
+				}
+
 				// Find the addresses in the address key.
 				addressKey, _ := sec.GetKey("Address")
 				if addressKey == nil {
@@ -514,6 +571,45 @@ func (nd *networkd) SetIfaceAddresses(_ context.Context, iface string, addrs []*
 	}
 
 	return nil
+}
+
+// Set the DHCP client state on an interface.
+func (nd *networkd) SetIfaceDHCP(_ context.Context, iface string, dhcp4, dhcp6 bool) (err error) {
+	for _, n := range nd.Networks {
+		if n.Name != iface {
+			continue
+		}
+
+		// Get the network section to modify it.
+		sec, err := n.Config.GetSection("Network")
+		if err != nil {
+			return err
+		}
+		if err = setNetworkdDHCP(sec, dhcp4, dhcp6); err != nil {
+			return err
+		}
+
+		// Save the network.
+		err = n.Save(nd.configDir, nd.backupRetention)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// renewDHCP has systemd-networkd re-read its configuration and reapply it to
+// the interface, starting the DHCP client that was just enabled. `networkctl
+// reload` picks up the file that was written; `reconfigure` is what actually
+// re-runs the interface's configuration, and reload alone would leave the
+// change pending until the link next changed state.
+func (nd *networkd) renewDHCP(ctx context.Context, iface string) error {
+	if _, err := runCommand(ctx, "networkctl", "reload"); err != nil {
+		return err
+	}
+	_, err := runCommand(ctx, "networkctl", "reconfigure", iface)
+	return err
 }
 
 // Set static routes to interface.

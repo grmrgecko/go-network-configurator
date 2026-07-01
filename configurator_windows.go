@@ -3,10 +3,12 @@ package netconfig
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -21,17 +23,22 @@ type windowsConfigurator struct {
 	*configOptions
 }
 
-// Returns the windows network configurator. Behaviour is tuned with Option
-// values such as WithTestAddress and WithConnectivityCheck; use SetLogger to
-// replace the package-wide logger.
-func NewConfigurator(opts ...Option) (configurator Configurator, err error) {
+// Returns the windows network configurator. ctx is accepted to match the Linux
+// constructor, whose backend detection queries the init system; nothing here
+// needs it. Behaviour is tuned with Option values such as WithTestAddress and
+// WithConnectivityCheck; use SetLogger to replace the package-wide logger.
+//
+// Unlike Linux, no backend is required: winipcfg writes an adapter's addresses
+// and routes straight into the registry, so a change persists across a reboot
+// without any configuration file behind it. cloud-init is registered when found
+// so an image-provisioned host keeps its two sources of truth in step.
+func NewConfigurator(ctx context.Context, opts ...Option) (Configurator, error) {
 	options := newConfigOptions(opts...)
 	c := new(windowsConfigurator)
 	c.configOptions = options
-	configurator = c
 
 	var ci *cloudInit
-	ci, err = newCloudInit(options.backupRetention)
+	ci, err := newCloudInit(options.backupRetention)
 	if err != nil {
 		logger.Println("error parsing cloud-init:", err)
 	}
@@ -44,8 +51,28 @@ func NewConfigurator(opts ...Option) (configurator Configurator, err error) {
 
 	// Detection failures are logged above; they are not fatal to constructing
 	// the configurator, so do not propagate them to the caller.
-	err = nil
-	return
+	return c, nil
+}
+
+// ipAdapterDHCPState reports whether the adapter runs a DHCP client for each
+// address family. Windows exposes the two very differently: DHCPv4 is an
+// adapter flag, while there is no DHCPv6 flag at all — an adapter is running a
+// DHCPv6 client exactly when one of its addresses says it was learned from one.
+func ipAdapterDHCPState(ipAdapter *winipcfg.IPAdapterAddresses) (dhcp4, dhcp6 bool) {
+	dhcp4 = ipAdapter.Flags&winipcfg.IPAAFlagDhcpv4Enabled != 0
+	for unicast := ipAdapter.FirstUnicastAddress; unicast != nil; unicast = unicast.Next {
+		ip := unicast.Address.IP()
+		if ip == nil || ip.To4() != nil {
+			continue
+		}
+		// IP_ADAPTER_UNICAST_ADDRESS carries the raw Win32 enum, so compare
+		// against winipcfg's typed constant for it rather than a bare 3.
+		if unicast.PrefixOrigin == int32(winipcfg.PrefixOriginDHCP) {
+			dhcp6 = true
+			break
+		}
+	}
+	return dhcp4, dhcp6
 }
 
 // Get IP addresses from ip adapter.
@@ -106,6 +133,32 @@ func ipAdapterAddresses(ipAdapter *winipcfg.IPAdapterAddresses) (addresses []*ne
 	return
 }
 
+// adapterIsPhysical reports whether an adapter is backed by hardware. The
+// interface type cannot answer that on its own: Windows hands a Hyper-V virtual
+// switch, a VPN client's tunnel, and a real NIC the same Ethernet type. The
+// interface row's hardware flag does answer it, and the endpoint flag rules out
+// the host's own side of a virtual switch, which claims hardware backing it does
+// not have. Adapters whose row cannot be read fall back to the interface type.
+func adapterIsPhysical(adapter *winipcfg.IPAdapterAddresses) bool {
+	row, err := adapter.LUID.Interface()
+	if err != nil {
+		return isPhysicalIfType(adapter.IfType)
+	}
+	if row.InterfaceAndOperStatusFlags&winipcfg.IAOSFEndPointInterface != 0 {
+		return false
+	}
+	return row.InterfaceAndOperStatusFlags&winipcfg.IAOSFHardwareInterface != 0
+}
+
+// isPhysicalIfType reports whether an interface type is one a physical NIC uses.
+func isPhysicalIfType(ifType winipcfg.IfType) bool {
+	switch uint32(ifType) {
+	case windows.IF_TYPE_ETHERNET_CSMACD, windows.IF_TYPE_IEEE80211:
+		return true
+	}
+	return false
+}
+
 // Get list of interfaces and their configs.
 func (c *windowsConfigurator) GetInterfaces(ctx context.Context) (interfaces []*Interface, err error) {
 	// Reference of zero IP addresses.
@@ -137,6 +190,9 @@ func (c *windowsConfigurator) GetInterfaces(ctx context.Context) (interfaces []*
 		i.Name = ipAdapter.FriendlyName()
 		i.MAC = ipAdapter.PhysicalAddress()
 		i.Link = ipAdapter.LUID
+		i.Up = ipAdapter.OperStatus == winipcfg.IfOperStatusUp
+		i.Physical = adapterIsPhysical(ipAdapter)
+		i.DHCP4, i.DHCP6 = ipAdapterDHCPState(ipAdapter)
 		for _, addr := range ipAdapterAddresses(ipAdapter) {
 			if !addr.IP.IsLinkLocalUnicast() {
 				i.Addresses = append(i.Addresses, addr)
@@ -1006,5 +1062,238 @@ routeLoop:
 func (c *windowsConfigurator) SetDNS(ctx context.Context, iface string, servers []net.IP, searchDomains []string) error {
 	applyIfaceDNS(ctx, c.ifaceBackends, iface, servers, searchDomains)
 	applyLiveDNSWindows(ctx, iface, servers, searchDomains)
+	return nil
+}
+
+// runNetsh runs netsh and folds its output into any error. netsh reports its
+// failures on stdout, not stderr, so without this a failed call surfaces as a
+// bare "exit status 1" with the reason discarded.
+func runNetsh(ctx context.Context, args ...string) error {
+	out, err := runCommand(ctx, "netsh", args...)
+	if err == nil {
+		return nil
+	}
+	if reason := strings.TrimSpace(strings.Join(out, " ")); reason != "" {
+		return fmt.Errorf("netsh %s: %w: %s", strings.Join(args, " "), err, reason)
+	}
+	return fmt.Errorf("netsh %s: %w", strings.Join(args, " "), err)
+}
+
+// The netsh argument builders below all use the named-parameter form rather than
+// netsh's positional shorthand ("set address name=X static 1.2.3.4 255.255.255.0
+// 1.2.3.1"), which is order-sensitive and reads as a puzzle.
+
+// netshEnableDHCP4Args switches an adapter's IPv4 configuration to DHCP. This
+// both records the choice and starts the DHCP client, discarding whatever
+// static addresses the adapter held.
+func netshEnableDHCP4Args(iface string) []string {
+	return []string{"interface", "ipv4", "set", "address", "name=" + iface, "source=dhcp"}
+}
+
+// netshDNSFromDHCP4Args makes the adapter take its resolvers from the lease.
+// Switching the address source to DHCP does not do this: the DNS servers are a
+// separate setting and a statically configured resolver survives the switch.
+func netshDNSFromDHCP4Args(iface string) []string {
+	return []string{"interface", "ipv4", "set", "dnsservers", "name=" + iface, "source=dhcp"}
+}
+
+// netshSetStatic4Args replaces the adapter's IPv4 configuration with a single
+// static address. There is no netsh verb for "stop being a DHCP client": an
+// adapter leaves DHCP by being given a static address, so this is how DHCPv4 is
+// turned off.
+//
+// A nil gateway is written as "none" rather than omitted. Omitting it leaves the
+// previous default gateway in place, which on an adapter that has just stopped
+// leasing means keeping a gateway the DHCP server handed out.
+func netshSetStatic4Args(iface string, addr *net.IPNet, gateway net.IP) []string {
+	args := []string{
+		"interface", "ipv4", "set", "address",
+		"name=" + iface,
+		"source=static",
+		"address=" + addr.IP.String(),
+		"mask=" + net.IP(addr.Mask).String(),
+	}
+	if gateway != nil {
+		return append(args, "gateway="+gateway.String())
+	}
+	return append(args, "gateway=none")
+}
+
+// netshAddStatic4Args adds a secondary static IPv4 address. "set address"
+// replaces the adapter's entire IPv4 configuration with the one address it is
+// given, so every address after the first has to be re-added with this.
+func netshAddStatic4Args(iface string, addr *net.IPNet) []string {
+	return []string{
+		"interface", "ipv4", "add", "address",
+		"name=" + iface,
+		"address=" + addr.IP.String(),
+		"mask=" + net.IP(addr.Mask).String(),
+	}
+}
+
+// netshSetDHCP6Args turns the DHCPv6 client on or off.
+//
+// IPv6 has no "source=dhcp" counterpart, because Windows does not model DHCPv6
+// as an address source. A host runs a DHCPv6 client when a router advertisement
+// tells it to, via the M (managed address) and O (other stateful config) bits;
+// these two interface flags are the local override of those bits. Router
+// discovery is enabled alongside them because DHCPv6 conveys no default route —
+// only router advertisements do — so an interface leasing an address with
+// router discovery off would have no way to reach anything.
+//
+// Disabling leaves router discovery alone: whatever default route the RA
+// provides is not this call's to take away.
+func netshSetDHCP6Args(iface string, enable bool) []string {
+	args := []string{"interface", "ipv6", "set", "interface", "interface=" + iface}
+	if enable {
+		return append(args, "routerdiscovery=enabled", "managedaddress=enabled", "otherstateful=enabled")
+	}
+	return append(args, "managedaddress=disabled", "otherstateful=disabled")
+}
+
+// ipconfigRenewArgs asks the DHCP client to acquire a lease now. Switching the
+// address source to DHCP starts the client, but a renew makes the lease arrive
+// before this call returns rather than at the client's own pace.
+func ipconfigRenewArgs(iface string) []string {
+	return []string{"/renew", iface}
+}
+
+// requireElevation reports an error unless this process holds an elevated token.
+// Every write path below reconfigures a live NIC and fails with a bare access
+// denied otherwise; under UAC an account in the Administrators group still runs
+// with a filtered standard-user token unless it was explicitly elevated. Saying
+// so up front beats a netsh error the caller has to decode.
+func requireElevation() error {
+	if windows.GetCurrentProcessToken().IsElevated() {
+		return nil
+	}
+	return fmt.Errorf("changing an adapter's DHCP configuration requires an elevated process")
+}
+
+// Enable or disable the DHCP client for each address family on an interface.
+//
+// Windows keeps no configuration file of its own, so unlike Linux the adapter is
+// both the persisted configuration and the running system, and there is nothing
+// to reconcile later: the netsh calls below record the choice and act on it at
+// once. A file backend that is also present (cloudbase-init) is written first,
+// so a re-provision does not undo what was just set.
+//
+// The two families are asymmetric. IPv4 has an address source that can be set to
+// dhcp or static. IPv6 does not — DHCPv6 is driven by the router advertisement's
+// M and O bits, which netshSetDHCP6Args overrides locally. Note that a DHCPv6
+// lease carries no default route, so an interface's IPv6 reachability still
+// depends on router advertisements either way.
+func (c *windowsConfigurator) SetDHCP(ctx context.Context, iface string, dhcp4, dhcp6 bool) error {
+	// Check this before touching anything, so a non-elevated caller is told why
+	// rather than left with the file backends written and the adapter untouched.
+	if err := requireElevation(); err != nil {
+		return err
+	}
+
+	applyIfaceDHCP(ctx, c.ifaceBackends, iface, dhcp4, dhcp6)
+
+	var errs []error
+	if err := setAdapterDHCP4(ctx, iface, dhcp4); err != nil {
+		errs = append(errs, err)
+	}
+	if err := runNetsh(ctx, netshSetDHCP6Args(iface, dhcp6)...); err != nil {
+		errs = append(errs, fmt.Errorf("failed to set dhcp6 on %s: %w", iface, err))
+	}
+	return errors.Join(errs...)
+}
+
+// setAdapterDHCP4 switches the adapter's IPv4 address source.
+func setAdapterDHCP4(ctx context.Context, iface string, enable bool) error {
+	if enable {
+		if err := runNetsh(ctx, netshEnableDHCP4Args(iface)...); err != nil {
+			return fmt.Errorf("failed to enable dhcp4 on %s: %w", iface, err)
+		}
+
+		// The resolvers are a separate setting that survives the address-source
+		// switch; a statically configured one would otherwise outlive the static
+		// address it was set alongside. Failing to hand DNS back to the lease
+		// leaves a working interface, so it is logged rather than returned.
+		if err := runNetsh(ctx, netshDNSFromDHCP4Args(iface)...); err != nil {
+			logger.Printf("SetDHCP: %s: enabled dhcp4 but failed to take DNS from the lease: %v", iface, err)
+		}
+
+		// Setting the source starts the DHCP client; renewing makes the lease
+		// arrive before this call returns. A renew that finds no DHCP server
+		// fails, which does not undo the configuration that was just written.
+		if _, err := runCommand(ctx, "ipconfig", ipconfigRenewArgs(iface)...); err != nil {
+			logger.Printf("SetDHCP: %s: enabled dhcp4 but no lease acquired yet: %v", iface, err)
+		}
+		return nil
+	}
+
+	// An adapter leaves DHCP by being given a static address. Re-assert the
+	// addresses it currently holds — which are the leased ones — so it keeps the
+	// address it is reachable on and simply stops renewing it.
+	adapter, err := findAdapter(iface)
+	if err != nil {
+		return err
+	}
+
+	// An adapter that is not leasing has nothing to convert. Running the static
+	// assignment on it anyway would tear its IPv4 configuration down and build
+	// it back up for no reason.
+	if dhcp4, _ := ipAdapterDHCPState(adapter); !dhcp4 {
+		return nil
+	}
+
+	addrs := ipv4AdapterAddresses(adapter)
+	if len(addrs) == 0 {
+		return fmt.Errorf("cannot disable dhcp4 on %s: it holds no IPv4 address to keep statically", iface)
+	}
+
+	// "set address" replaces the adapter's whole IPv4 configuration with the one
+	// address it is given, so the rest are re-added after it.
+	if err := runNetsh(ctx, netshSetStatic4Args(iface, addrs[0], ipAdapterGateway4(adapter))...); err != nil {
+		return fmt.Errorf("failed to disable dhcp4 on %s: %w", iface, err)
+	}
+	var errs []error
+	for _, addr := range addrs[1:] {
+		if err := runNetsh(ctx, netshAddStatic4Args(iface, addr)...); err != nil {
+			errs = append(errs, fmt.Errorf("failed to restore secondary address %s on %s: %w", addr, iface, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// findAdapter returns the adapter with the given friendly name, which is the
+// name netsh and ipconfig also identify it by.
+func findAdapter(iface string) (*winipcfg.IPAdapterAddresses, error) {
+	ipAdapters, err := winipcfg.GetAdaptersAddresses(windows.AF_UNSPEC, winipcfg.GAAFlagIncludePrefix|winipcfg.GAAFlagSkipAnycast|winipcfg.GAAFlagSkipMulticast|winipcfg.GAAFlagSkipDNSServer|winipcfg.GAAFlagSkipFriendlyName|winipcfg.GAAFlagSkipDNSInfo)
+	if err != nil {
+		return nil, err
+	}
+	for _, ipAdapter := range ipAdapters {
+		if ipAdapter.FriendlyName() == iface {
+			return ipAdapter, nil
+		}
+	}
+	return nil, fmt.Errorf("no adapter found with name: %s", iface)
+}
+
+// ipv4AdapterAddresses returns every non-link-local IPv4 address the adapter
+// holds, in the order it holds them, which is what converting it from DHCP to
+// static must re-assert.
+func ipv4AdapterAddresses(adapter *winipcfg.IPAdapterAddresses) (addrs []*net.IPNet) {
+	for _, addr := range ipAdapterAddresses(adapter) {
+		if addr.IP.To4() == nil || addr.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs
+}
+
+// ipAdapterGateway4 returns the adapter's first IPv4 default gateway, or nil.
+func ipAdapterGateway4(ipAdapter *winipcfg.IPAdapterAddresses) net.IP {
+	for gw := ipAdapter.FirstGatewayAddress; gw != nil; gw = gw.Next {
+		if ip := gw.Address.IP(); ip != nil && ip.To4() != nil {
+			return ip
+		}
+	}
 	return nil
 }

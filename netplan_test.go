@@ -6,47 +6,36 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Validate the netplan configuration parser/writer functions.
 func TestNetplan(t *testing.T) {
 	// Setup test file.
 	tmpDir, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	configPath := filepath.Join(tmpDir, "netplan.yaml")
 	testDir, err := filepath.Abs("./tests/netplan")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	resultsDir := filepath.Join(testDir, "results")
 	err = fileCopy(filepath.Join(testDir, "netplan.yaml"), configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	err = fileCopy(filepath.Join(testDir, "netplan2.yaml"), filepath.Join(tmpDir, "netplan2.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Setup ifupdown and parse test file.
 	np, err := readNetplanConfigDirectory(tmpDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Get the interfaces state.
 	interfaces, err := np.GetInterfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Verify interfaces read from file.
 	err = testVerifyInterfaces(interfaces, resultsDir, 1)
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 
 	// Test setting the IP addresses on an interface.
 	err = np.SetIfaceAddresses(context.Background(), "test_eth0.1556", []*net.IPNet{
@@ -63,9 +52,7 @@ func TestNetplan(t *testing.T) {
 			Mask: net.CIDRMask(64, 128),
 		},
 	}, net.ParseIP("1.2.3.1"), net.ParseIP("fc00::1"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Test setting routes on an interface.
 	err = np.SetIfaceRoutes(context.Background(), "test_eth3", []*Route{
@@ -86,27 +73,19 @@ func TestNetplan(t *testing.T) {
 			Metric:  100,
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Get the interfaces state.
 	interfaces, err = np.GetInterfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Verify interfaces read from file.
 	err = testVerifyInterfaces(interfaces, resultsDir, 2)
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 
 	// Read the current file and expected state.
 	err = testVerifyResults(resultsDir, tmpDir, 1)
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 
 	// Test setting the IP addresses on an interface.
 	err = np.SetIfaceAddresses(context.Background(), "test_eth0", []*net.IPNet{
@@ -115,37 +94,25 @@ func TestNetplan(t *testing.T) {
 			Mask: net.CIDRMask(24, 32),
 		},
 	}, net.ParseIP("1.2.10.254"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Test setting routes on an interface.
 	err = np.SetIfaceRoutes(context.Background(), "test_eth0.1556", []*Route{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Get the interfaces state.
 	interfaces, err = np.GetInterfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Verify interfaces read from file.
 	err = testVerifyInterfaces(interfaces, resultsDir, 3)
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 
 	// Read the current file and expected state.
 	err = testVerifyResults(resultsDir, tmpDir, 2)
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 
 	// Cleanup.
 	err = os.RemoveAll(tmpDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 }

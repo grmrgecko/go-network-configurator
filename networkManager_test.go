@@ -10,6 +10,8 @@ import (
 
 	"github.com/Wifx/gonetworkmanager/v3"
 	"github.com/godbus/dbus/v5"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type mockNMConnection struct {
@@ -321,9 +323,7 @@ func TestNetworkManager(t *testing.T) {
 	// Setup test file.
 	tmpDir := "/tmp/networkManager-netconfig-Test"
 	testDir, err := filepath.Abs("./tests/networkManager")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	resultsDir := filepath.Join(testDir, "results")
 
 	// Update the PATH environment variable so that our nmcli is used instead of the systems.
@@ -336,15 +336,11 @@ func TestNetworkManager(t *testing.T) {
 
 	// Get the interfaces state.
 	interfaces, err := n.GetInterfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Verify interfaces read from file.
 	err = testVerifyInterfaces(interfaces, resultsDir, 1)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 
 	// Test setting the IP addresses on an interface.
 	err = n.SetIfaceAddresses(context.Background(), "test_eth0.1556", []*net.IPNet{
@@ -361,9 +357,7 @@ func TestNetworkManager(t *testing.T) {
 			Mask: net.CIDRMask(64, 128),
 		},
 	}, net.ParseIP("1.2.3.1"), net.ParseIP("fc00::1"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Test setting routes on an interface.
 	err = n.SetIfaceRoutes(context.Background(), "test_eth2", []*Route{
@@ -384,9 +378,7 @@ func TestNetworkManager(t *testing.T) {
 			Metric:  100,
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Test setting DNS on an interface; static DNS should disable automatic DNS.
 	err = n.SetIfaceDNS(context.Background(), "test_eth0", []net.IP{
@@ -394,15 +386,11 @@ func TestNetworkManager(t *testing.T) {
 		net.ParseIP("1.1.1.1"),
 		net.ParseIP("2001:4860:4860::8888"),
 	}, []string{"example.com"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Read the current file and expected state.
 	err = testVerifyResults(resultsDir, tmpDir, 1)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 
 	// Test setting the IP addresses on an interface.
 	err = n.SetIfaceAddresses(context.Background(), "test_eth0", []*net.IPNet{
@@ -411,27 +399,19 @@ func TestNetworkManager(t *testing.T) {
 			Mask: net.CIDRMask(24, 32),
 		},
 	}, net.ParseIP("1.2.10.254"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Test setting routes on an interface.
 	err = n.SetIfaceRoutes(context.Background(), "test_eth0.1556", []*Route{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// Read the current file and expected state.
 	err = testVerifyResults(resultsDir, tmpDir, 2)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 
 	// Cleanup.
 	err = os.RemoveAll(tmpDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 }
 
 // nmNameservers must read the modern dns-data (strings) as well as the legacy
@@ -445,30 +425,21 @@ func TestNMDNSParsing(t *testing.T) {
 	}
 	got := nmNameservers(group)
 	want := []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1")}
-	if !equalIPs(got, want) {
-		t.Errorf("dns-data = %v, want %v", got, want)
-	}
-	if search := nmSearchDomains(group); len(search) != 2 || search[0] != "a.test" || search[1] != "b.test" {
-		t.Errorf("dns-search = %v, want [a.test b.test]", search)
-	}
+	assert.Truef(t, equalIPs(got, want), "dns-data = %v, want %v", got, want)
+	search := nmSearchDomains(group)
+	assert.Falsef(t, len(search) != 2 || search[0] != "a.test" || search[1] != "b.test", "dns-search = %v, want [a.test b.test]", search)
 
 	// Legacy ipv4 "dns" as []uint32 (decoded via uint2IP, matching addresses).
 	ipv4Legacy := map[string]any{"dns": []uint32{ip2Uint(net.ParseIP("1.2.3.4"))}}
-	if got := nmNameservers(ipv4Legacy); len(got) != 1 || !got[0].Equal(net.ParseIP("1.2.3.4")) {
-		t.Errorf("legacy ipv4 dns = %v, want [1.2.3.4]", got)
-	}
+	gotV4 := nmNameservers(ipv4Legacy)
+	assert.Falsef(t, len(gotV4) != 1 || !gotV4[0].Equal(net.ParseIP("1.2.3.4")), "legacy ipv4 dns = %v, want [1.2.3.4]", gotV4)
 
 	// Legacy ipv6 "dns" as [][]byte.
 	ipv6Legacy := map[string]any{"dns": [][]byte{net.ParseIP("2001:4860:4860::8888").To16()}}
-	if got := nmNameservers(ipv6Legacy); len(got) != 1 || !got[0].Equal(net.ParseIP("2001:4860:4860::8888")) {
-		t.Errorf("legacy ipv6 dns = %v, want [2001:4860:4860::8888]", got)
-	}
+	gotV6 := nmNameservers(ipv6Legacy)
+	assert.Falsef(t, len(gotV6) != 1 || !gotV6[0].Equal(net.ParseIP("2001:4860:4860::8888")), "legacy ipv6 dns = %v, want [2001:4860:4860::8888]", gotV6)
 
 	// Empty group yields nothing.
-	if v := nmNameservers(map[string]any{}); len(v) != 0 {
-		t.Errorf("empty group dns = %v, want empty", v)
-	}
-	if v := nmSearchDomains(map[string]any{}); len(v) != 0 {
-		t.Errorf("empty group dns-search = %v, want empty", v)
-	}
+	assert.Emptyf(t, nmNameservers(map[string]any{}), "empty group dns, want empty")
+	assert.Emptyf(t, nmSearchDomains(map[string]any{}), "empty group dns-search, want empty")
 }

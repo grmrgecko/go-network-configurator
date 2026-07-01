@@ -111,6 +111,7 @@ func ip2Uint(ip net.IP) uint32 {
 // cancelled or expired context terminates it.
 func runCommand(ctx context.Context, command string, args ...string) (out []string, err error) {
 	cmd := exec.CommandContext(ctx, command, args...)
+	hideCommandWindow(cmd)
 
 	// Get output pipes.
 	var stdout, stderr io.ReadCloser
@@ -166,6 +167,48 @@ func runCommand(ctx context.Context, command string, args ...string) (out []stri
 		return
 	}
 	return
+}
+
+// naturalLess compares two strings the way a person reads them, comparing a run
+// of digits by the number it spells rather than character by character, so eth2
+// sorts before eth10 and enp0s3 before enp0s10. Digit runs are compared without
+// being parsed, so a name carrying a number too large for an integer still
+// orders sensibly.
+func naturalLess(a, b string) bool {
+	for a != "" && b != "" {
+		if isDigit(a[0]) && isDigit(b[0]) {
+			var aNum, bNum string
+			aNum, a = leadingDigits(a)
+			bNum, b = leadingDigits(b)
+			// Leading zeros change the text but not the value.
+			aNum = strings.TrimLeft(aNum, "0")
+			bNum = strings.TrimLeft(bNum, "0")
+			if len(aNum) != len(bNum) {
+				return len(aNum) < len(bNum)
+			}
+			if aNum != bNum {
+				return aNum < bNum
+			}
+			continue
+		}
+		if a[0] != b[0] {
+			return a[0] < b[0]
+		}
+		a, b = a[1:], b[1:]
+	}
+	return len(a) < len(b)
+}
+
+// isDigit reports whether c is an ASCII digit.
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// leadingDigits splits s into its leading run of digits and the rest.
+func leadingDigits(s string) (digits, rest string) {
+	i := 0
+	for i < len(s) && isDigit(s[i]) {
+		i++
+	}
+	return s[:i], s[i:]
 }
 
 // ipStrings converts a list of IPs to their string form, skipping nil entries.

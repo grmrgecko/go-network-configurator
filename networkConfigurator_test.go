@@ -5,14 +5,15 @@ import (
 	"errors"
 	"net"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func mustCIDR(t *testing.T, s string) *net.IPNet {
 	t.Helper()
 	_, n, err := net.ParseCIDR(s)
-	if err != nil {
-		t.Fatalf("ParseCIDR(%q): %v", s, err)
-	}
+	require.NoError(t, err)
 	return n
 }
 
@@ -22,9 +23,7 @@ func TestRouteString(t *testing.T) {
 		Gateway:     net.ParseIP("10.0.0.1"),
 		Metric:      100,
 	}
-	if got, want := r.String(), "10.0.0.0/24 via 10.0.0.1 metric 100"; got != want {
-		t.Errorf("Route.String() = %q, want %q", got, want)
-	}
+	assert.Equal(t, "10.0.0.0/24 via 10.0.0.1 metric 100", r.String())
 }
 
 func TestInterfaceString(t *testing.T) {
@@ -38,11 +37,8 @@ func TestInterfaceString(t *testing.T) {
 			{Destination: mustCIDR(t, "10.0.0.0/24"), Gateway: net.ParseIP("10.0.0.1"), Metric: 5},
 		},
 	}
-	got := iface.String()
 	want := "Name: eth0 MAC: 00:11:22:33:44:55 Addresses: [192.168.1.0/24] Gateway4: 192.168.1.1 Gateway6: <nil> Routes: [10.0.0.0/24 via 10.0.0.1 metric 5]"
-	if got != want {
-		t.Errorf("Interface.String()\n got %q\nwant %q", got, want)
-	}
+	assert.Equal(t, want, iface.String())
 }
 
 func TestFindInterfaceByName(t *testing.T) {
@@ -52,39 +48,104 @@ func TestFindInterfaceByName(t *testing.T) {
 	ifaces := []*Interface{eth1, eth0, pub6}
 
 	t.Run("by name", func(t *testing.T) {
-		if got := FindInterfaceByName("eth1", ifaces); got != eth1 {
-			t.Errorf("got %v, want eth1", got)
-		}
+		assert.Equal(t, eth1, FindInterfaceByName("eth1", ifaces))
 	})
 
 	t.Run("public picks gateway4 interface", func(t *testing.T) {
-		if got := FindInterfaceByName(Public, ifaces); got != eth0 {
-			t.Errorf("got %v, want eth0", got)
-		}
+		assert.Equal(t, eth0, FindInterfaceByName(Public, ifaces))
 	})
 
 	t.Run("public6 picks gateway6 interface", func(t *testing.T) {
-		if got := FindInterfaceByName(Public6, ifaces); got != pub6 {
-			t.Errorf("got %v, want pub6", got)
-		}
+		assert.Equal(t, pub6, FindInterfaceByName(Public6, ifaces))
 	})
 
 	t.Run("not found", func(t *testing.T) {
-		if got := FindInterfaceByName("missing", ifaces); got != nil {
-			t.Errorf("got %v, want nil", got)
-		}
+		assert.Nil(t, FindInterfaceByName("missing", ifaces))
 	})
 
 	t.Run("public with no gateway returns nil", func(t *testing.T) {
-		if got := FindInterfaceByName(Public, []*Interface{eth1}); got != nil {
-			t.Errorf("got %v, want nil", got)
-		}
+		assert.Nil(t, FindInterfaceByName(Public, []*Interface{eth1}))
 	})
 
 	t.Run("public6 with no gateway returns nil", func(t *testing.T) {
-		if got := FindInterfaceByName(Public6, []*Interface{eth1}); got != nil {
-			t.Errorf("got %v, want nil", got)
+		assert.Nil(t, FindInterfaceByName(Public6, []*Interface{eth1}))
+	})
+}
+
+// names extracts the interface names of a result slice, for comparing an
+// expected ordering in one assertion.
+func names(ifaces []*Interface) []string {
+	out := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		out = append(out, iface.Name)
+	}
+	return out
+}
+
+func TestFindPhysicalInterfaces(t *testing.T) {
+	t.Run("drops virtual interfaces", func(t *testing.T) {
+		ifaces := []*Interface{
+			{Name: "docker0", Up: true},
+			{Name: "eth0", Up: true, Physical: true},
+			{Name: "veth1a2b", Up: true},
 		}
+		assert.Equal(t, []string{"eth0"}, names(FindPhysicalInterfaces(ifaces)))
+	})
+
+	t.Run("up before down", func(t *testing.T) {
+		ifaces := []*Interface{
+			{Name: "eth0", Physical: true},
+			{Name: "eth1", Up: true, Physical: true},
+		}
+		assert.Equal(t, []string{"eth1", "eth0"}, names(FindPhysicalInterfaces(ifaces)))
+	})
+
+	t.Run("gateway before none, v4 before v6", func(t *testing.T) {
+		ifaces := []*Interface{
+			{Name: "eth0", Up: true, Physical: true},
+			{Name: "eth1", Up: true, Physical: true, Gateway6: net.ParseIP("2001:db8::1")},
+			{Name: "eth2", Up: true, Physical: true, Gateway4: net.ParseIP("203.0.113.1")},
+		}
+		assert.Equal(t, []string{"eth2", "eth1", "eth0"}, names(FindPhysicalInterfaces(ifaces)))
+	})
+
+	t.Run("up outranks a gateway on a down interface", func(t *testing.T) {
+		ifaces := []*Interface{
+			{Name: "eth0", Physical: true, Gateway4: net.ParseIP("203.0.113.1")},
+			{Name: "eth1", Up: true, Physical: true},
+		}
+		assert.Equal(t, []string{"eth1", "eth0"}, names(FindPhysicalInterfaces(ifaces)))
+	})
+
+	t.Run("wired before wireless before other", func(t *testing.T) {
+		ifaces := []*Interface{
+			{Name: "ppp0", Up: true, Physical: true},
+			{Name: "wlp2s0", Up: true, Physical: true},
+			{Name: "enp1s0", Up: true, Physical: true},
+		}
+		assert.Equal(t, []string{"enp1s0", "wlp2s0", "ppp0"}, names(FindPhysicalInterfaces(ifaces)))
+	})
+
+	t.Run("names ordered as a human reads them", func(t *testing.T) {
+		ifaces := []*Interface{
+			{Name: "eth10", Up: true, Physical: true},
+			{Name: "eth2", Up: true, Physical: true},
+			{Name: "eth0", Up: true, Physical: true},
+		}
+		assert.Equal(t, []string{"eth0", "eth2", "eth10"}, names(FindPhysicalInterfaces(ifaces)))
+	})
+
+	t.Run("windows friendly names rank as wired and wireless", func(t *testing.T) {
+		ifaces := []*Interface{
+			{Name: "Wi-Fi", Up: true, Physical: true},
+			{Name: "Ethernet 2", Up: true, Physical: true},
+		}
+		assert.Equal(t, []string{"Ethernet 2", "Wi-Fi"}, names(FindPhysicalInterfaces(ifaces)))
+	})
+
+	t.Run("no physical interfaces returns empty", func(t *testing.T) {
+		assert.Empty(t, FindPhysicalInterfaces([]*Interface{{Name: "br0", Up: true}}))
+		assert.Empty(t, FindPhysicalInterfaces(nil))
 	})
 }
 
@@ -96,17 +157,6 @@ func TestReorderPrimaryAddress(t *testing.T) {
 			out[i] = a.IP.String()
 		}
 		return out
-	}
-	equal := func(a, b []string) bool {
-		if len(a) != len(b) {
-			return false
-		}
-		for i := range a {
-			if a[i] != b[i] {
-				return false
-			}
-		}
-		return true
 	}
 
 	// hostIP keeps the host bits so IP.Equal matching is exercised, unlike the
@@ -123,43 +173,27 @@ func TestReorderPrimaryAddress(t *testing.T) {
 
 	t.Run("middle moves to front", func(t *testing.T) {
 		got, ok := reorderPrimaryAddress([]*net.IPNet{a, b, c}, b)
-		if !ok {
-			t.Fatal("ok = false, want true")
-		}
-		if want := []string{"192.168.1.11", "192.168.1.10", "192.168.1.12"}; !equal(addrStrings(got), want) {
-			t.Errorf("got %v, want %v", addrStrings(got), want)
-		}
+		require.True(t, ok)
+		assert.Equal(t, []string{"192.168.1.11", "192.168.1.10", "192.168.1.12"}, addrStrings(got))
 	})
 
 	t.Run("already first is unchanged", func(t *testing.T) {
 		got, ok := reorderPrimaryAddress([]*net.IPNet{a, b, c}, a)
-		if !ok {
-			t.Fatal("ok = false, want true")
-		}
-		if want := []string{"192.168.1.10", "192.168.1.11", "192.168.1.12"}; !equal(addrStrings(got), want) {
-			t.Errorf("got %v, want %v", addrStrings(got), want)
-		}
+		require.True(t, ok)
+		assert.Equal(t, []string{"192.168.1.10", "192.168.1.11", "192.168.1.12"}, addrStrings(got))
 	})
 
 	t.Run("v6 target preserves v4 relative order", func(t *testing.T) {
 		got, ok := reorderPrimaryAddress([]*net.IPNet{a, b, v6}, v6)
-		if !ok {
-			t.Fatal("ok = false, want true")
-		}
-		if want := []string{"2001:db8::5", "192.168.1.10", "192.168.1.11"}; !equal(addrStrings(got), want) {
-			t.Errorf("got %v, want %v", addrStrings(got), want)
-		}
+		require.True(t, ok)
+		assert.Equal(t, []string{"2001:db8::5", "192.168.1.10", "192.168.1.11"}, addrStrings(got))
 	})
 
 	t.Run("absent target returns false", func(t *testing.T) {
 		got, ok := reorderPrimaryAddress([]*net.IPNet{a, b}, c)
-		if ok {
-			t.Error("ok = true, want false")
-		}
+		assert.False(t, ok)
 		// The original slice is returned unchanged.
-		if want := []string{"192.168.1.10", "192.168.1.11"}; !equal(addrStrings(got), want) {
-			t.Errorf("got %v, want %v", addrStrings(got), want)
-		}
+		assert.Equal(t, []string{"192.168.1.10", "192.168.1.11"}, addrStrings(got))
 	})
 }
 
@@ -168,8 +202,17 @@ type fakeIfaceBackend struct {
 	addrCalls  int
 	routeCalls int
 	dnsCalls   int
+	dhcpCalls  int
 	lastAddrs  []*net.IPNet
+	lastDHCP4  bool
+	lastDHCP6  bool
 	err        error
+}
+
+func (f *fakeIfaceBackend) SetIfaceDHCP(_ context.Context, iface string, dhcp4, dhcp6 bool) error {
+	f.dhcpCalls++
+	f.lastDHCP4, f.lastDHCP6 = dhcp4, dhcp6
+	return f.err
 }
 
 func (f *fakeIfaceBackend) SetIfaceAddresses(_ context.Context, iface string, addrs []*net.IPNet, gateway4, gateway6 net.IP) error {
@@ -221,9 +264,8 @@ func TestApplyIfaceAddresses(t *testing.T) {
 		{name: "ok", backend: ok},
 	}
 	applyIfaceAddresses(context.Background(), backends, "eth0", nil, nil, nil)
-	if failing.addrCalls != 1 || ok.addrCalls != 1 {
-		t.Errorf("addr calls: failing=%d ok=%d, want 1 each", failing.addrCalls, ok.addrCalls)
-	}
+	assert.Equal(t, 1, failing.addrCalls)
+	assert.Equal(t, 1, ok.addrCalls)
 }
 
 func TestApplyIfaceRoutes(t *testing.T) {
@@ -234,9 +276,8 @@ func TestApplyIfaceRoutes(t *testing.T) {
 		{name: "ok", backend: ok},
 	}
 	applyIfaceRoutes(context.Background(), backends, "eth0", nil)
-	if failing.routeCalls != 1 || ok.routeCalls != 1 {
-		t.Errorf("route calls: failing=%d ok=%d, want 1 each", failing.routeCalls, ok.routeCalls)
-	}
+	assert.Equal(t, 1, failing.routeCalls)
+	assert.Equal(t, 1, ok.routeCalls)
 }
 
 func TestReloadPanels(t *testing.T) {
@@ -247,9 +288,8 @@ func TestReloadPanels(t *testing.T) {
 		{name: "ok", backend: ok},
 	}
 	reloadPanels(context.Background(), backends)
-	if failing.reloadCalls != 1 || ok.reloadCalls != 1 {
-		t.Errorf("reload calls: failing=%d ok=%d, want 1 each", failing.reloadCalls, ok.reloadCalls)
-	}
+	assert.Equal(t, 1, failing.reloadCalls)
+	assert.Equal(t, 1, ok.reloadCalls)
 }
 
 func TestSetMainIPOnPanels(t *testing.T) {
@@ -260,9 +300,8 @@ func TestSetMainIPOnPanels(t *testing.T) {
 		{name: "ok", backend: ok},
 	}
 	setMainIPOnPanels(context.Background(), backends, net.ParseIP("192.0.2.5"))
-	if failing.setMainIPCalls != 1 || ok.setMainIPCalls != 1 {
-		t.Errorf("setMainIP calls: failing=%d ok=%d, want 1 each", failing.setMainIPCalls, ok.setMainIPCalls)
-	}
+	assert.Equal(t, 1, failing.setMainIPCalls)
+	assert.Equal(t, 1, ok.setMainIPCalls)
 }
 
 func TestRemoveIPFromPanels(t *testing.T) {
@@ -273,9 +312,8 @@ func TestRemoveIPFromPanels(t *testing.T) {
 		{name: "ok", backend: ok},
 	}
 	removeIPFromPanels(context.Background(), backends, net.ParseIP("192.0.2.5"))
-	if failing.removeIPCalls != 1 || ok.removeIPCalls != 1 {
-		t.Errorf("removeIP calls: failing=%d ok=%d, want 1 each", failing.removeIPCalls, ok.removeIPCalls)
-	}
+	assert.Equal(t, 1, failing.removeIPCalls)
+	assert.Equal(t, 1, ok.removeIPCalls)
 }
 
 // fakeDNSReaderBackend is a file backend that also reports back persisted
@@ -292,48 +330,46 @@ func (f *fakeDNSReaderBackend) SetIfaceRoutes(context.Context, string, []*Route)
 func (f *fakeDNSReaderBackend) SetIfaceDNS(context.Context, string, []net.IP, []string) error {
 	return nil
 }
-func (f *fakeDNSReaderBackend) GetInterfaces() ([]*Interface, error) { return f.ifaces, f.err }
+func (f *fakeDNSReaderBackend) SetIfaceDHCP(context.Context, string, bool, bool) error { return nil }
+func (f *fakeDNSReaderBackend) GetInterfaces() ([]*Interface, error)                   { return f.ifaces, f.err }
 
-// mergeDNSFromBackends must union DNS from every backend into the matching
-// runtime interface (by name), de-duplicate entries so multi-backend hosts do
-// not list a resolver twice, skip backends with no matching interface, and keep
-// going when one backend errors.
-func TestMergeDNSFromBackends(t *testing.T) {
+// mergeBackendState must union DNS from every backend into the matching runtime
+// interface (by name), de-duplicate entries so multi-backend hosts do not list a
+// resolver twice, OR the DHCP flags so a client enabled in any backend is
+// reported, skip backends with no matching interface, and keep going when one
+// backend errors.
+func TestMergeBackendState(t *testing.T) {
 	runtime := []*Interface{{Name: "eth0"}, {Name: "eth1"}}
 	backends := []namedIfaceBackend{
 		{name: "broken", backend: &fakeDNSReaderBackend{err: errors.New("boom")}},
 		{name: "netplan", backend: &fakeDNSReaderBackend{ifaces: []*Interface{
-			{Name: "eth0", DNS: []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("2001:4860:4860::8888")}, SearchDomains: []string{"example.com"}},
+			{Name: "eth0", DNS: []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("2001:4860:4860::8888")}, SearchDomains: []string{"example.com"}, DHCP4: true},
 		}}},
 		{name: "cloud-init", backend: &fakeDNSReaderBackend{ifaces: []*Interface{
-			// Overlaps netplan (must dedupe) and adds one new entry.
-			{Name: "eth0", DNS: []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1")}, SearchDomains: []string{"example.com", "corp.example"}},
+			// Overlaps netplan (must dedupe) and adds one new entry. DHCP4 is
+			// false here and must not clear the true netplan reported.
+			{Name: "eth0", DNS: []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1")}, SearchDomains: []string{"example.com", "corp.example"}, DHCP6: true},
 		}}},
 		{name: "ifupdown", backend: &fakeDNSReaderBackend{ifaces: []*Interface{
 			{Name: "eth1", DNS: []net.IP{net.ParseIP("9.9.9.9")}, SearchDomains: []string{"a.test"}},
 			// No runtime match; must be ignored.
-			{Name: "eth9", DNS: []net.IP{net.ParseIP("10.0.0.1")}},
+			{Name: "eth9", DNS: []net.IP{net.ParseIP("10.0.0.1")}, DHCP4: true},
 		}}},
 	}
-	mergeDNSFromBackends(backends, runtime)
+	mergeBackendState(backends, runtime)
 
 	eth0 := runtime[0]
 	wantDNS := []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("2001:4860:4860::8888"), net.ParseIP("1.1.1.1")}
-	if !equalIPs(eth0.DNS, wantDNS) {
-		t.Errorf("eth0 DNS = %v, want %v", eth0.DNS, wantDNS)
-	}
+	assert.True(t, equalIPs(eth0.DNS, wantDNS))
 	wantSearch := []string{"example.com", "corp.example"}
-	if len(eth0.SearchDomains) != len(wantSearch) || eth0.SearchDomains[0] != wantSearch[0] || eth0.SearchDomains[1] != wantSearch[1] {
-		t.Errorf("eth0 SearchDomains = %v, want %v", eth0.SearchDomains, wantSearch)
-	}
+	assert.Equal(t, wantSearch, eth0.SearchDomains)
+	assert.True(t, eth0.DHCP4, "netplan reported DHCP4; cloud-init's false must not clear it")
+	assert.True(t, eth0.DHCP6, "cloud-init reported DHCP6")
 
 	eth1 := runtime[1]
-	if !equalIPs(eth1.DNS, []net.IP{net.ParseIP("9.9.9.9")}) {
-		t.Errorf("eth1 DNS = %v, want [9.9.9.9]", eth1.DNS)
-	}
-	if len(eth1.SearchDomains) != 1 || eth1.SearchDomains[0] != "a.test" {
-		t.Errorf("eth1 SearchDomains = %v, want [a.test]", eth1.SearchDomains)
-	}
+	assert.True(t, equalIPs(eth1.DNS, []net.IP{net.ParseIP("9.9.9.9")}))
+	assert.Equal(t, []string{"a.test"}, eth1.SearchDomains)
+	assert.False(t, eth1.DHCP4, "eth9's DHCP4 must not leak onto eth1")
 }
 
 func equalIPs(a, b []net.IP) bool {

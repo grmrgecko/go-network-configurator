@@ -37,14 +37,14 @@ backend is logged but does not abort the others.
 
 **Network configuration (persistence)**
 
-| Backend             | Detection                                   |
-| ------------------- | ------------------------------------------- |
-| netplan             | `netplan` binary on `PATH`                  |
-| cloud-init          | cloud-init network config present           |
-| NetworkManager      | `NetworkManager.service` active             |
-| systemd-networkd    | `systemd-networkd.service` active           |
-| RHEL network-scripts| `network.service` active (config dir on legacy hosts) |
-| ifupdown            | `/etc/network/interfaces`                   |
+| Backend             | Detection                                              |
+| ------------------- | ----------------------------------------------------- |
+| netplan             | `netplan` binary on `PATH`, and `netplan info` succeeds |
+| cloud-init          | cloud-init network config present                     |
+| NetworkManager      | `NetworkManager` service running or enabled, or its pid file present |
+| systemd-networkd    | `systemd-networkd` service running or enabled         |
+| RHEL network-scripts| `network` service running or enabled                  |
+| ifupdown            | `/etc/network/interfaces`, and the `networking` service running or enabled |
 
 **Control panels**
 
@@ -54,11 +54,12 @@ backend is logged but does not abort the others.
 | Plesk     | `/usr/sbin/plesk`                  |
 | InterWorx | `/usr/bin/nodeworx`                |
 
-Detection of the service-managed backends (NetworkManager, systemd-networkd,
-and RHEL network-scripts) uses systemd over D-Bus, with a fallback for legacy
-systems that lack a usable systemd D-Bus interface (Ubuntu 14.04 Upstart,
-CentOS 5/6). On that fallback path network-scripts is detected by the presence
-of its `/etc/sysconfig/network-scripts` directory.
+### How service-managed backends are detected
+
+A service counts as managing the network when it is **running now** or
+**enabled to start at boot**. Enablement matters on its own: this library writes
+configuration that must survive a reboot, and a manager that is enabled but not
+yet started still owns the network after the next boot.
 
 ## Platforms
 
@@ -71,7 +72,7 @@ of its `/etc/sysconfig/network-scripts` directory.
 ```go
 type Configurator interface {
     // Enumerate interfaces with their addresses, gateways, static routes,
-    // DNS servers, and search domains.
+    // DNS servers, search domains, and DHCP client state.
     GetInterfaces(ctx context.Context) ([]*Interface, error)
 
     // Add an IP address (optionally setting/replacing the default gateway).
@@ -89,15 +90,23 @@ type Configurator interface {
 
     // Set the DNS servers and search domains for an interface.
     SetDNS(ctx context.Context, iface string, servers []net.IP, searchDomains []string) error
+
+    // Turn each address family's DHCP client on or off.
+    SetDHCP(ctx context.Context, iface string, dhcp4, dhcp6 bool) error
 }
 
 // Construct the configurator for the current OS, auto-detecting backends.
-// Behaviour is tuned with Option values (see Options below).
-func NewConfigurator(opts ...Option) (Configurator, error)
+// ctx bounds the detection; behaviour is tuned with Option values (see
+// Options below).
+func NewConfigurator(ctx context.Context, opts ...Option) (Configurator, error)
 
 // Resolve an interface by name, or by the special "public-internet" /
 // "public-internet-6" selectors.
 func FindInterfaceByName(name string, ifaces []*Interface) *Interface
+
+// Filter to the hardware-backed interfaces, best candidate for internet
+// configuration first.
+func FindPhysicalInterfaces(ifaces []*Interface) []*Interface
 ```
 
 Every operation takes a `context.Context`. The slow steps — the ICMP probe of a
@@ -109,6 +118,16 @@ deadlines, so a caller can bound how long a change may block.
 `SetDNS` applies an interface's resolvers and search domains to the live
 resolver so they take effect immediately, and persists them through whichever
 network management backends are detected on the host so they survive a reboot.
+
+### DHCP
+
+`SetDHCP` turns each address family's DHCP client on or off independently —
+moving an interface to DHCPv4 while keeping a static IPv6 address is
+`SetDHCP(ctx, "eth0", true, false)`. Enabling a family acquires a lease now
+through the detected manager; disabling only rewrites the configuration, leaving
+an existing lease to expire so a caller connected over the leased address is not
+cut off. `AddAddress` never changes DHCP state — it adds static addresses only.
+`Interface.DHCP4` and `Interface.DHCP6` report the state back.
 
 ### Logging
 
@@ -125,7 +144,7 @@ netconfig.SetLogger(myLogger) // anything with Printf/Println, e.g. *log.Logger
 `NewConfigurator` accepts functional options:
 
 ```go
-c, err := netconfig.NewConfigurator(
+c, err := netconfig.NewConfigurator(ctx,
     netconfig.WithTestAddress("http://my-canary/health"), // connectivity-test URL
     netconfig.WithConnectivityCheck(false),                // skip the post-change probe + rollback
     netconfig.WithSkipConnectivityCheck(),                 // same as WithConnectivityCheck(false)
@@ -135,6 +154,8 @@ c, err := netconfig.NewConfigurator(
     netconfig.WithBackupRetention(10),                     // .bak.* copies kept per config file (0 = keep all)
     netconfig.WithAllowPrimaryRemoval(true),               // let RemoveAddress remove the primary IP
     netconfig.WithSkipPanels(true),                        // skip all panel interaction (add/primary/remove)
+    netconfig.WithAllowNoBackends(true),                   // don't fail when no persistence backend is detected
+    netconfig.WithServiceReadyTimeout(90 * time.Second),   // how long to wait for a daemon-backed backend (default 60s, 0 = don't wait)
 )
 ```
 
@@ -155,11 +176,44 @@ the override only when you are deliberately tearing down the current primary.
 InterWorx to reload, set the main IP, or release an IP. Only the running system
 and the network-manager configuration files are changed.
 
+### Choosing an interface
+
 `FindInterfaceByName` accepts two well-known selectors in addition to a literal
 interface name:
 
 - `"public-internet"` — the interface that carries the IPv4 default gateway.
 - `"public-internet-6"` — the interface that carries the IPv6 default gateway.
+
+Those answer "which interface is already on the internet". When the host is not
+on the internet yet — a freshly provisioned VM, an image whose NIC name is not
+known in advance — `FindPhysicalInterfaces` answers "which interface should be".
+It drops the devices that should never carry a public address (bridges, bonds,
+VLANs, tunnels, container veth pairs) and returns what is left in the order a
+caller should try them:
+
+1. Interfaces that are up, before those that are down.
+2. Interfaces already carrying a default gateway, IPv4 ahead of IPv6-only.
+3. Wired ahead of wireless.
+4. By name as a person reads it, so `eth0` precedes `eth1` and `eth2`
+   precedes `eth10`.
+
+Paravirtual NICs (virtio, vmxnet, Xen) count as physical: a VM's only real
+interface is still the one to configure. The result is a ranking, not a
+decision — a caller with a further requirement, such as an interface not already
+holding a public address, filters the slice and takes the first survivor:
+
+```go
+ifaces, err := c.GetInterfaces(ctx)
+for _, iface := range netconfig.FindPhysicalInterfaces(ifaces) {
+    if !hasPublicAddress(iface) {
+        return iface.Name
+    }
+}
+```
+
+`Interface.Up` and `Interface.Physical` carry the two facts this ranking rests
+on, and are readable on their own. Both describe the running system, so they are
+only set by `GetInterfaces`.
 
 ## Usage
 
@@ -177,7 +231,7 @@ import (
 func main() {
     ctx := context.Background()
 
-    c, err := netconfig.NewConfigurator()
+    c, err := netconfig.NewConfigurator(ctx)
     if err != nil {
         log.Fatal(err)
     }

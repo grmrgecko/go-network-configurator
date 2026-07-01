@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // readIfcfg parses a written ifcfg-<iface> file back into a key/value map so
@@ -13,9 +16,7 @@ import (
 func readIfcfg(t *testing.T, dir, iface string) map[string]string {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(dir, "ifcfg-"+iface))
-	if err != nil {
-		t.Fatalf("read ifcfg-%s: %v", iface, err)
-	}
+	require.NoError(t, err)
 	out := make(map[string]string)
 	for _, line := range splitLines(string(data)) {
 		k, v, ok := cutKV(line)
@@ -68,32 +69,21 @@ func TestNetworkScriptsDNSPeerDNS(t *testing.T) {
 	err := ns.SetIfaceDNS(context.Background(), "eth0",
 		[]net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("8.8.8.8")},
 		[]string{"example.com"})
-	if err != nil {
-		t.Fatalf("SetIfaceDNS: %v", err)
-	}
+	require.NoError(t, err)
 	cfg := readIfcfg(t, dir, "eth0")
-	if cfg["PEERDNS"] != "no" {
-		t.Errorf("PEERDNS = %q, want \"no\"", cfg["PEERDNS"])
-	}
-	if cfg["DNS1"] != "1.1.1.1" || cfg["DNS2"] != "8.8.8.8" {
-		t.Errorf("DNS1/DNS2 = %q/%q, want 1.1.1.1/8.8.8.8", cfg["DNS1"], cfg["DNS2"])
-	}
-	if cfg["DOMAIN"] != "example.com" {
-		t.Errorf("DOMAIN = %q, want example.com", cfg["DOMAIN"])
-	}
+	assert.Equal(t, "no", cfg["PEERDNS"])
+	assert.Equal(t, "1.1.1.1", cfg["DNS1"])
+	assert.Equal(t, "8.8.8.8", cfg["DNS2"])
+	assert.Equal(t, "example.com", cfg["DOMAIN"])
 
 	// Clearing DNS should drop PEERDNS so DHCP-provided resolvers resume.
 	err = ns.SetIfaceDNS(context.Background(), "eth0", nil, nil)
-	if err != nil {
-		t.Fatalf("SetIfaceDNS clear: %v", err)
-	}
+	require.NoError(t, err)
 	cfg = readIfcfg(t, dir, "eth0")
-	if _, ok := cfg["PEERDNS"]; ok {
-		t.Errorf("PEERDNS still present after clear: %q", cfg["PEERDNS"])
-	}
-	if _, ok := cfg["DNS1"]; ok {
-		t.Errorf("DNS1 still present after clear: %q", cfg["DNS1"])
-	}
+	_, ok := cfg["PEERDNS"]
+	assert.False(t, ok)
+	_, ok = cfg["DNS1"]
+	assert.False(t, ok)
 }
 
 // TestIfUpDownDNSEnsuresInterface verifies that SetIfaceDNS creates the
@@ -102,30 +92,21 @@ func TestNetworkScriptsDNSPeerDNS(t *testing.T) {
 func TestIfUpDownDNSEnsuresInterface(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "interfaces")
-	if err := os.WriteFile(cfgPath, []byte("auto lo\niface lo inet loopback\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
+	err := os.WriteFile(cfgPath, []byte("auto lo\niface lo inet loopback\n"), 0644)
+	require.NoError(t, err)
 	i := &ifUpDown{BaseConfig: cfgPath, BackupDir: cfgPath + ".backup"}
-	if err := i.ReadFile(cfgPath); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, i.ReadFile(cfgPath))
 
 	// eth0 is not present in the file; SetIfaceDNS must create it.
-	err := i.SetIfaceDNS(context.Background(), "eth0",
+	err = i.SetIfaceDNS(context.Background(), "eth0",
 		[]net.IP{net.ParseIP("1.1.1.1")}, []string{"example.com"})
-	if err != nil {
-		t.Fatalf("SetIfaceDNS: %v", err)
-	}
+	require.NoError(t, err)
 
 	// Re-read from disk and confirm the stanzas were persisted.
 	i.Interfaces = nil
-	if err := i.ReadFile(cfgPath); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, i.ReadFile(cfgPath))
 	interfaces, err := i.GetInterfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var found *Interface
 	for _, iface := range interfaces {
 		if iface.Name == "eth0" {
@@ -133,13 +114,8 @@ func TestIfUpDownDNSEnsuresInterface(t *testing.T) {
 			break
 		}
 	}
-	if found == nil {
-		t.Fatal("eth0 was not persisted; SetIfaceDNS silently no-opped")
-	}
-	if len(found.DNS) != 1 || !found.DNS[0].Equal(net.ParseIP("1.1.1.1")) {
-		t.Errorf("DNS = %v, want [1.1.1.1]", found.DNS)
-	}
-	if len(found.SearchDomains) != 1 || found.SearchDomains[0] != "example.com" {
-		t.Errorf("SearchDomains = %v, want [example.com]", found.SearchDomains)
-	}
+	require.NotNil(t, found, "eth0 was not persisted; SetIfaceDNS silently no-opped")
+	require.Len(t, found.DNS, 1)
+	assert.True(t, found.DNS[0].Equal(net.ParseIP("1.1.1.1")), "DNS = %v, want [1.1.1.1]", found.DNS)
+	assert.Equal(t, []string{"example.com"}, found.SearchDomains)
 }

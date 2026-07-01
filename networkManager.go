@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/Wifx/gonetworkmanager/v3"
+	"github.com/godbus/dbus/v5"
 	"github.com/vishvananda/netlink"
 )
 
@@ -15,6 +17,8 @@ type nmConnection struct {
 	ID         string
 	Name       string
 	UsingData  bool
+	Method4    string
+	Method6    string
 	Addresses4 []*net.IPNet
 	Addresses6 []*net.IPNet
 	Gateway4   net.IP
@@ -23,6 +27,35 @@ type nmConnection struct {
 	Routes6    []*Route
 	DNS        []net.IP
 	DNSSearch  []string
+}
+
+// dhcpState reports whether each family's DHCP client is enabled. IPv4 "auto"
+// means DHCPv4. For IPv6, "auto" means router advertisements plus DHCPv6 when
+// the router asks for it, and "dhcp" means DHCPv6 alone; both run a client.
+func (c *nmConnection) dhcpState() (dhcp4, dhcp6 bool) {
+	dhcp4 = c.Method4 == "auto"
+	dhcp6 = c.Method6 == "auto" || c.Method6 == "dhcp"
+	return dhcp4, dhcp6
+}
+
+// nmStaticMethod4 is the ipv4.method to leave behind when DHCPv4 is turned off:
+// "manual" when the connection still carries static addresses to serve, and
+// "disabled" when turning off the lease leaves it with no IPv4 at all.
+func nmStaticMethod4(hasAddrs bool) string {
+	if hasAddrs {
+		return "manual"
+	}
+	return "disabled"
+}
+
+// nmStaticMethod6 is the ipv6.method counterpart. An IPv6 interface with no
+// addresses keeps its link-local one rather than losing IPv6 entirely, which is
+// what "disabled" would do.
+func nmStaticMethod6(hasAddrs bool) string {
+	if hasAddrs {
+		return "manual"
+	}
+	return "link-local"
 }
 
 type networkManager struct {
@@ -89,6 +122,11 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 		return
 	}
 	conn.Name = name
+
+	// Get the addressing method of each family. These decide whether a DHCP
+	// client runs, independently of any static addresses parsed below.
+	conn.Method4, _ = settings["ipv4"]["method"].(string)
+	conn.Method6, _ = settings["ipv6"]["method"].(string)
 
 	// Get the IPv4 address map, and confirm the newer configuration style is used.
 	addrMap, ok := settings["ipv4"]["address-data"]
@@ -259,8 +297,62 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 	return
 }
 
-// Verify netplan exists, and try parsing its configurations.
-func newNetworkManager() (nm *networkManager, err error) {
+// nmBusName is the well-known D-Bus name the NetworkManager daemon takes once
+// it is running. Until some process owns it, there is nothing on the bus to
+// answer a configuration call.
+const nmBusName = "org.freedesktop.NetworkManager"
+
+// nmBusNameOwned reports whether the NetworkManager daemon currently owns its
+// bus name — the "is the socket live" question. It is asked before any property
+// is read, because NetworkManager is D-Bus activatable: reading a property on
+// an unowned name asks the bus to *start* the daemon. Waiting for a service to
+// come up on its own must not be the thing that launches it.
+func nmBusNameOwned(conn *dbus.Conn) (bool, error) {
+	var owned bool
+	err := conn.BusObject().Call("org.freedesktop.DBus.NameHasOwner", 0, nmBusName).Store(&owned)
+	return owned, err
+}
+
+// networkManagerReady reports whether NetworkManager is on the bus and has
+// finished starting up. The two are distinct: the daemon takes its bus name
+// early, then spends a while bringing up the connections it is configured to
+// activate at boot. Its Startup property stays true for that window, and a
+// connection modified during it can be overwritten as startup completes.
+//
+// A missing system bus is reported as "not ready" rather than as a hard error,
+// because a host early enough in boot to beat NetworkManager can also be early
+// enough to beat dbus-daemon.
+func networkManagerReady() (bool, error) {
+	conn, err := dbus.SystemBus()
+	if err != nil {
+		return false, err
+	}
+	owned, err := nmBusNameOwned(conn)
+	if err != nil || !owned {
+		return false, err
+	}
+
+	daemon, err := gonetworkmanager.NewNetworkManager()
+	if err != nil {
+		return false, err
+	}
+	startup, err := daemon.GetPropertyStartup()
+	if err != nil {
+		return false, err
+	}
+	return !startup, nil
+}
+
+// newNetworkManager waits for the NetworkManager daemon to be ready, then opens
+// its settings interface. Unlike the file backends, NetworkManager is
+// configured through a running daemon, so a configurator built while it is
+// still starting would hold a settings handle that reports no connections and
+// accepts no changes.
+func newNetworkManager(ctx context.Context, readyTimeout time.Duration) (nm *networkManager, err error) {
+	if err = waitForServiceReady(ctx, "NetworkManager", readyTimeout, networkManagerReady); err != nil {
+		return nil, err
+	}
+
 	config, err := gonetworkmanager.NewSettings()
 	if err != nil {
 		return
@@ -326,6 +418,7 @@ func (nm *networkManager) GetInterfaces() (interfaces []*Interface, err error) {
 		i.Name = connection.Name
 		i.MAC = mac
 		i.Link = foundLink
+		i.DHCP4, i.DHCP6 = connection.dhcpState()
 
 		// Append addresses.
 		for _, addr := range connection.Addresses4 {
@@ -408,42 +501,123 @@ func (nm *networkManager) SetIfaceAddresses(ctx context.Context, iface string, a
 			return
 		}
 
+		// Read the current addressing method of each family. NetworkManager
+		// serves static addresses alongside a lease when the method is "auto",
+		// so a connection already on DHCP keeps it: changing an address is not
+		// a request to stop using DHCP, and SetIfaceDHCP is how that is asked
+		// for. Only a family that is not already leasing is moved to "manual"
+		// (or off, when it is left with no addresses at all).
+		method4, _ := settings["ipv4"]["method"].(string)
+		method6, _ := settings["ipv6"]["method"].(string)
+		conn := &nmConnection{Method4: method4, Method6: method6}
+		dhcp4, dhcp6 := conn.dhcpState()
+
 		// Update address list for IPv4.
-		if len(addrs4) == 0 {
-			_, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv4.method", "disabled", "ipv4.addresses", "", "ipv4.gateway", "")
-			if err != nil {
-				errs = append(errs, fmt.Errorf("failed to disable ipv4 on %s: %w", id, err))
-			}
-		} else {
-			gateway4S := ""
-			if gateway4 != nil {
-				gateway4S = gateway4.String()
-			}
-			_, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv4.method", "manual", "ipv4.addresses", strings.Join(addrs4, ","), "ipv4.gateway", gateway4S)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("failed to set ipv4.addresses on %s: %w", id, err))
-			}
+		newMethod4 := nmStaticMethod4(len(addrs4) != 0)
+		if dhcp4 {
+			newMethod4 = "auto"
+		}
+		gateway4S := ""
+		if gateway4 != nil && len(addrs4) != 0 {
+			gateway4S = gateway4.String()
+		}
+		_, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv4.method", newMethod4, "ipv4.addresses", strings.Join(addrs4, ","), "ipv4.gateway", gateway4S)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to set ipv4.addresses on %s: %w", id, err))
 		}
 
 		// Update address list for IPv6.
-		if len(addrs6) == 0 {
-			_, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv6.method", "link-local", "ipv6.addresses", "", "ipv6.gateway", "")
-			if err != nil {
-				errs = append(errs, fmt.Errorf("failed to set ipv6 link-local on %s: %w", id, err))
-			}
-		} else {
-			gateway6S := ""
-			if gateway6 != nil {
-				gateway6S = gateway6.String()
-			}
-			_, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv6.method", "manual", "ipv6.addresses", strings.Join(addrs6, ","), "ipv6.gateway", gateway6S)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("failed to set ipv6.addresses on %s: %w", id, err))
-			}
+		newMethod6 := nmStaticMethod6(len(addrs6) != 0)
+		if dhcp6 {
+			newMethod6 = method6
+		}
+		gateway6S := ""
+		if gateway6 != nil && len(addrs6) != 0 {
+			gateway6S = gateway6.String()
+		}
+		_, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv6.method", newMethod6, "ipv6.addresses", strings.Join(addrs6, ","), "ipv6.gateway", gateway6S)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to set ipv6.addresses on %s: %w", id, err))
 		}
 	}
 
 	return errors.Join(errs...)
+}
+
+// Set the DHCP client state on an interface.
+func (nm *networkManager) SetIfaceDHCP(ctx context.Context, iface string, dhcp4, dhcp6 bool) (err error) {
+	// Get connections from NM.
+	connections, err := nm.config.ListConnections()
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+
+	// Find the connections that has the interfaces.
+	for _, c := range connections {
+		// Get the settings of the connection.
+		var settings gonetworkmanager.ConnectionSettings
+		settings, err = c.GetSettings()
+		if err != nil {
+			return err
+		}
+
+		// Get the interface name.
+		name, ok := settings["connection"]["interface-name"].(string)
+		if !ok || name != iface {
+			continue
+		}
+
+		// Get the interface id.
+		id, ok := settings["connection"]["id"].(string)
+		if !ok {
+			return fmt.Errorf("failed to get interface id")
+		}
+
+		// Parse the connection so turning a lease off can fall back to the
+		// method that still serves whatever static addresses it holds.
+		conn, parseErr := nm.ParseConnection(settings)
+		if parseErr != nil {
+			errs = append(errs, fmt.Errorf("failed to parse connection %s: %w", id, parseErr))
+			continue
+		}
+
+		// Switch the IPv4 method. "auto" is DHCPv4; NetworkManager keeps
+		// serving any ipv4.addresses the connection carries alongside it.
+		method4 := "auto"
+		if !dhcp4 {
+			method4 = nmStaticMethod4(len(conn.Addresses4) != 0)
+		}
+		if _, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv4.method", method4); err != nil {
+			errs = append(errs, fmt.Errorf("failed to set ipv4.method on %s: %w", id, err))
+		}
+
+		// Switch the IPv6 method. A connection already on "auto" is left there
+		// rather than forced to "dhcp": both run a DHCPv6 client, and "auto"
+		// additionally honors router advertisements, which turning it into
+		// "dhcp" would silently switch off.
+		method6 := "auto"
+		if dhcp6 && conn.Method6 == "dhcp" {
+			method6 = "dhcp"
+		} else if !dhcp6 {
+			method6 = nmStaticMethod6(len(conn.Addresses6) != 0)
+		}
+		if _, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv6.method", method6); err != nil {
+			errs = append(errs, fmt.Errorf("failed to set ipv6.method on %s: %w", id, err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// renewDHCP has NetworkManager reapply the connection profile to the device, so
+// a client it was just told to run starts and acquires a lease. `device
+// reapply` changes the device in place and, unlike `connection up`, does not
+// tear the link down first.
+func (nm *networkManager) renewDHCP(ctx context.Context, iface string) error {
+	_, err := runCommand(ctx, "nmcli", "device", "reapply", iface)
+	return err
 }
 
 // Set static routes to interface.
