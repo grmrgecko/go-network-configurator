@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	dbus "github.com/coreos/go-systemd/dbus"
+	dbus "github.com/coreos/go-systemd/v22/dbus"
 )
 
 // rcRunlevels are the SysV runlevels a network service can be started in.

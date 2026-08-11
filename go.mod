@@ -2,12 +2,10 @@ module github.com/grmrgecko/go-network-configurator
 
 go 1.24.2
 
-replace github.com/coreos/go-systemd => github.com/coreos/go-systemd/v22 v22.5.0
-
 require (
 	dario.cat/mergo v1.0.2
 	github.com/Wifx/gonetworkmanager/v3 v3.2.0
-	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
+	github.com/coreos/go-systemd/v22 v22.5.0
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/kylelemons/godebug v1.1.0
 	github.com/prometheus-community/pro-bing v0.7.0
