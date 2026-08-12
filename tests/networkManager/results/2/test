@@ -4,6 +4,7 @@ connection modify test ipv4.routes 10.253.2.0/24 203.0.113.22 100
 connection modify test ipv6.routes abcd:ef12:3455:10::/64 abcd:ef12:3456:10::1 100
 connection modify test_eth0 ipv4.dns 8.8.8.8,1.1.1.1 ipv4.dns-search example.com ipv4.ignore-auto-dns yes
 connection modify test_eth0 ipv6.dns 2001:4860:4860::8888 ipv6.dns-search example.com ipv6.ignore-auto-dns yes
+device reapply test_eth0
 connection modify test_eth0 ipv4.method auto ipv4.addresses 1.2.10.4/24 ipv4.gateway 1.2.10.254
 connection modify test_eth0 ipv6.method auto ipv6.addresses ipv6.gateway
 connection modify main ipv4.routes

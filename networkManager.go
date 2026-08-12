@@ -869,5 +869,18 @@ func (nm *networkManager) SetIfaceDNS(ctx context.Context, iface string, servers
 		}
 	}
 
+	// Put the resolvers into effect. Writing them to the profile alone leaves
+	// the running device on whatever it resolved through before, and the
+	// ignore-auto-dns above means that is now nothing at all where the old
+	// resolvers came from a lease -- a device holding an address, a route, and
+	// no way to resolve a name. Unlike turning a DHCP client off, this carries
+	// no risk for a caller connected over the interface: reapply changes the
+	// device in place and does not tear the link down.
+	if len(targets) != 0 {
+		if rerr := reapplyDevice(ctx, iface); rerr != nil {
+			logger.Printf("error applying the connection profile to %s: %v", iface, rerr)
+		}
+	}
+
 	return errors.Join(errs...)
 }
