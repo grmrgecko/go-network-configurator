@@ -738,16 +738,54 @@ func (nm *networkManager) SetIfaceDHCP(ctx context.Context, iface string, dhcp4,
 		}
 	}
 
+	// A device that is not activated holds no lease for anyone to be connected
+	// over, and left alone it goes on chasing the client just turned off: an
+	// activation NetworkManager cannot complete fails, deconfigures the
+	// interface -- taking with it any address configured underneath it -- and
+	// is not retried until the profile's own autoconnect timer comes round,
+	// minutes later. Put the profile into effect now so the device comes up on
+	// the configuration it was just given. An activated device is left alone,
+	// as promised: turning a client off does not tear down the lease it holds.
+	if len(targets) != 0 && (!dhcp4 || !dhcp6) && !nmDeviceActivated(ctx, iface) {
+		if rerr := reapplyDevice(ctx, iface); rerr != nil {
+			logger.Printf("error applying the connection profile to %s: %v", iface, rerr)
+		}
+	}
+
 	return errors.Join(errs...)
 }
 
-// renewDHCP has NetworkManager reapply the connection profile to the device, so
-// a client it was just told to run starts and acquires a lease. `device
-// reapply` changes the device in place and, unlike `connection up`, does not
-// tear the link down first.
-func (nm *networkManager) renewDHCP(ctx context.Context, iface string) error {
+// reapplyDevice has NetworkManager put the interface's connection profile into
+// effect. `device reapply` changes the device in place and, unlike `connection
+// up`, does not tear the link down first.
+func reapplyDevice(ctx context.Context, iface string) error {
 	_, err := runCommand(ctx, "nmcli", "device", "reapply", iface)
 	return err
+}
+
+// renewDHCP reapplies the profile so a client the interface was just told to
+// run starts and acquires a lease.
+func (nm *networkManager) renewDHCP(ctx context.Context, iface string) error {
+	return reapplyDevice(ctx, iface)
+}
+
+// nmDeviceActivated reports whether NetworkManager has iface activated. A
+// device it cannot be asked about reads as activated, which is the answer that
+// leaves the running system alone.
+func nmDeviceActivated(ctx context.Context, iface string) bool {
+	daemon, err := gonetworkmanager.NewNetworkManager()
+	if err != nil {
+		return true
+	}
+	device, err := daemon.GetDeviceByIpIface(iface)
+	if err != nil {
+		return true
+	}
+	state, err := device.GetPropertyState()
+	if err != nil {
+		return true
+	}
+	return state == gonetworkmanager.NmDeviceStateActivated
 }
 
 // Set static routes to interface.
