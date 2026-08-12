@@ -115,13 +115,11 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 	}
 	conn.ID = id
 
-	// Get the interface name.
-	name, ok := settings["connection"]["interface-name"].(string)
-	if !ok {
-		err = fmt.Errorf("failed to get interface name")
-		return
-	}
-	conn.Name = name
+	// Get the interface name. A profile need not name one: NetworkManager binds
+	// its own default wired connections to a device by hardware address instead,
+	// and those are still connections this configures. Callers that need a name
+	// check for an empty one.
+	conn.Name, _ = settings["connection"]["interface-name"].(string)
 
 	// Get the addressing method of each family. These decide whether a DHCP
 	// client runs, independently of any static addresses parsed below.
@@ -297,6 +295,145 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 	return
 }
 
+// nmTarget is a saved connection that configures an interface, paired with the
+// id nmcli is driven with.
+type nmTarget struct {
+	ID       string
+	Settings gonetworkmanager.ConnectionSettings
+}
+
+// nmSettingsMAC returns the hardware address a profile is pinned to, or an empty
+// string when it is pinned to none. D-Bus reports mac-address as a byte array,
+// but a profile read back from a keyfile can surface it already printed, so both
+// are accepted.
+func nmSettingsMAC(settings gonetworkmanager.ConnectionSettings) string {
+	for _, group := range []string{"802-3-ethernet", "802-11-wireless"} {
+		switch mac := settings[group]["mac-address"].(type) {
+		case string:
+			return mac
+		case []byte:
+			if len(mac) != 0 {
+				return net.HardwareAddr(mac).String()
+			}
+		}
+	}
+	return ""
+}
+
+// nmActiveConnectionUUID returns the uuid of the profile NetworkManager has
+// active on iface. An interface with nothing active on it, and a host whose
+// nmcli cannot answer, both return an empty string: this only ever adds
+// candidates to a match, so failing to resolve it costs nothing beyond what
+// the interface name alone would have found.
+func nmActiveConnectionUUID(ctx context.Context, iface string) string {
+	out, err := runCommand(ctx, "nmcli", "-g", "GENERAL.CON-UUID", "device", "show", iface)
+	if err != nil {
+		return ""
+	}
+	for _, line := range out {
+		line = strings.TrimSpace(line)
+		// nmcli prints "--" for a device that is not connected.
+		if line != "" && line != "--" {
+			return line
+		}
+	}
+	return ""
+}
+
+// nmDeviceMAC returns the hardware address of iface as the running system
+// reports it, or an empty string when there is no such device.
+func nmDeviceMAC(iface string) string {
+	link, err := netlink.LinkByName(iface)
+	if err != nil {
+		return ""
+	}
+	return link.Attrs().HardwareAddr.String()
+}
+
+// connectionsFor returns the saved connections that configure iface.
+//
+// A profile that names an interface is bound to it and is the whole answer when
+// one exists. NetworkManager also binds profiles to a device by other means:
+// the default wired connection it creates for a device with no profile of its
+// own names no interface at all, and a profile can be pinned to a hardware
+// address instead. Matching on the name alone left a host whose only profile
+// was one of those with nothing to write to -- the change applied to the
+// running system and disappeared on the next reboot -- so when nothing names
+// the interface, the profile the device is actually running and any profile
+// pinned to its hardware address are matched instead.
+//
+// The fallback is only reached when the name matches nothing, so a host whose
+// profiles are named in the ordinary way pays neither of its lookups.
+func (nm *networkManager) connectionsFor(ctx context.Context, iface string) ([]nmTarget, error) {
+	connections, err := nm.config.ListConnections()
+	if err != nil {
+		return nil, err
+	}
+
+	// Read every profile once; both passes below work from the same snapshot.
+	var all []nmTarget
+	for _, c := range connections {
+		settings, serr := c.GetSettings()
+		if serr != nil {
+			return nil, serr
+		}
+		id, ok := settings["connection"]["id"].(string)
+		if !ok || id == "" {
+			// Without an id there is nothing to point nmcli at.
+			continue
+		}
+		all = append(all, nmTarget{ID: id, Settings: settings})
+	}
+
+	// Profiles bound to the interface by name.
+	matched := matchByIfaceName(all, iface)
+	if len(matched) != 0 {
+		return matched, nil
+	}
+
+	// Nothing names it: resolve what the device is running and what it is, and
+	// match on those instead.
+	matched = matchByDevice(all, nmActiveConnectionUUID(ctx, iface), nmDeviceMAC(iface))
+	if len(matched) == 0 {
+		logger.Printf("NetworkManager has no connection profile for %s; nothing to persist to", iface)
+	}
+	return matched, nil
+}
+
+// matchByIfaceName returns the profiles bound to iface by name.
+func matchByIfaceName(all []nmTarget, iface string) []nmTarget {
+	var matched []nmTarget
+	for _, t := range all {
+		if name, _ := t.Settings["connection"]["interface-name"].(string); name == iface {
+			matched = append(matched, t)
+		}
+	}
+	return matched
+}
+
+// matchByDevice returns the profiles bound to a device by something other than
+// its name: the one it is currently running, and any pinned to its hardware
+// address. A profile that names an interface is bound there and is never a
+// candidate here, whichever interface that is. Either identifier may be empty
+// on a host where it could not be resolved, which matches nothing rather than
+// everything.
+func matchByDevice(all []nmTarget, activeUUID, mac string) []nmTarget {
+	var matched []nmTarget
+	for _, t := range all {
+		if name, _ := t.Settings["connection"]["interface-name"].(string); name != "" {
+			continue
+		}
+		if uuid, _ := t.Settings["connection"]["uuid"].(string); activeUUID != "" && uuid == activeUUID {
+			matched = append(matched, t)
+			continue
+		}
+		if pinned := nmSettingsMAC(t.Settings); mac != "" && pinned != "" && strings.EqualFold(pinned, mac) {
+			matched = append(matched, t)
+		}
+	}
+	return matched
+}
+
 // nmBusName is the well-known D-Bus name the NetworkManager daemon takes once
 // it is running. Until some process owns it, there is nothing on the bus to
 // answer a configuration call.
@@ -313,6 +450,18 @@ func nmBusNameOwned(conn *dbus.Conn) (bool, error) {
 	return owned, err
 }
 
+// nmOnBus reports whether the NetworkManager daemon owns its bus name, opening
+// the system bus to ask. It answers the narrower question networkManagerReady
+// asks first: whether there is a daemon to configure at all, regardless of how
+// far along its startup is.
+func nmOnBus() (bool, error) {
+	conn, err := dbus.SystemBus()
+	if err != nil {
+		return false, err
+	}
+	return nmBusNameOwned(conn)
+}
+
 // networkManagerReady reports whether NetworkManager is on the bus and has
 // finished starting up. The two are distinct: the daemon takes its bus name
 // early, then spends a while bringing up the connections it is configured to
@@ -323,11 +472,7 @@ func nmBusNameOwned(conn *dbus.Conn) (bool, error) {
 // because a host early enough in boot to beat NetworkManager can also be early
 // enough to beat dbus-daemon.
 func networkManagerReady() (bool, error) {
-	conn, err := dbus.SystemBus()
-	if err != nil {
-		return false, err
-	}
-	owned, err := nmBusNameOwned(conn)
+	owned, err := nmOnBus()
 	if err != nil || !owned {
 		return false, err
 	}
@@ -348,9 +493,27 @@ func networkManagerReady() (bool, error) {
 // configured through a running daemon, so a configurator built while it is
 // still starting would hold a settings handle that reports no connections and
 // accepts no changes.
+//
+// Running out of that wait is not by itself a reason to give up on the backend.
+// The Startup property stays true for as long as any device is still working
+// through its initial activation, and a device retrying a lease no DHCP server
+// will ever answer holds it true indefinitely -- a state a host is most likely
+// to be in precisely when someone is about to give it a static address. What
+// the wait buys is a daemon that will not rewrite the change as it finishes
+// starting; a daemon that is on the bus is still configurable without it, and
+// dropping the backend instead would report a NetworkManager host as having
+// nowhere to persist its network configuration at all.
 func newNetworkManager(ctx context.Context, readyTimeout time.Duration) (nm *networkManager, err error) {
-	if err = waitForServiceReady(ctx, "NetworkManager", readyTimeout, networkManagerReady); err != nil {
-		return nil, err
+	if waitErr := waitForServiceReady(ctx, "NetworkManager", readyTimeout, networkManagerReady); waitErr != nil {
+		// A cancelled caller is not waiting for an answer any more.
+		if ctx.Err() != nil {
+			return nil, waitErr
+		}
+		owned, busErr := nmOnBus()
+		if busErr != nil || !owned {
+			return nil, waitErr
+		}
+		logger.Printf("NetworkManager has not finished starting up; configuring it anyway: %v", waitErr)
 	}
 
 	config, err := gonetworkmanager.NewSettings()
@@ -400,6 +563,13 @@ func (nm *networkManager) GetInterfaces() (interfaces []*Interface, err error) {
 		// interfaces slice depending purely on D-Bus connection ordering.
 		connection, parseErr := nm.ParseConnection(settings)
 		if parseErr != nil {
+			continue
+		}
+
+		// A profile that names no interface cannot be reported as one: there is
+		// no device name to key the merge by. It is still written to, which
+		// connectionsFor resolves separately.
+		if connection.Name == "" {
 			continue
 		}
 
@@ -468,38 +638,16 @@ func (nm *networkManager) SetIfaceAddresses(ctx context.Context, iface string, a
 		}
 	}
 
-	// Get connections from NM.
-	connections, err := nm.config.ListConnections()
+	// Find the connections that configure the interface.
+	targets, err := nm.connectionsFor(ctx, iface)
 	if err != nil {
 		return err
 	}
 
 	var errs []error
 
-	// Find the connections that has the interfaces.
-	for _, c := range connections {
-		// Get the settings of the connection.
-		var settings gonetworkmanager.ConnectionSettings
-		settings, err = c.GetSettings()
-		if err != nil {
-			return err
-		}
-
-		// Get the interface name.
-		name, ok := settings["connection"]["interface-name"].(string)
-		if !ok {
-			continue
-		}
-		if name != iface {
-			continue
-		}
-
-		// Get the interface id.
-		id, ok := settings["connection"]["id"].(string)
-		if !ok {
-			err = fmt.Errorf("failed to get interface id")
-			return
-		}
+	for _, t := range targets {
+		id, settings := t.ID, t.Settings
 
 		// Read the current addressing method of each family. NetworkManager
 		// serves static addresses alongside a lease when the method is "auto",
@@ -546,34 +694,16 @@ func (nm *networkManager) SetIfaceAddresses(ctx context.Context, iface string, a
 
 // Set the DHCP client state on an interface.
 func (nm *networkManager) SetIfaceDHCP(ctx context.Context, iface string, dhcp4, dhcp6 bool) (err error) {
-	// Get connections from NM.
-	connections, err := nm.config.ListConnections()
+	// Find the connections that configure the interface.
+	targets, err := nm.connectionsFor(ctx, iface)
 	if err != nil {
 		return err
 	}
 
 	var errs []error
 
-	// Find the connections that has the interfaces.
-	for _, c := range connections {
-		// Get the settings of the connection.
-		var settings gonetworkmanager.ConnectionSettings
-		settings, err = c.GetSettings()
-		if err != nil {
-			return err
-		}
-
-		// Get the interface name.
-		name, ok := settings["connection"]["interface-name"].(string)
-		if !ok || name != iface {
-			continue
-		}
-
-		// Get the interface id.
-		id, ok := settings["connection"]["id"].(string)
-		if !ok {
-			return fmt.Errorf("failed to get interface id")
-		}
+	for _, t := range targets {
+		id, settings := t.ID, t.Settings
 
 		// Parse the connection so turning a lease off can fall back to the
 		// method that still serves whatever static addresses it holds.
@@ -634,38 +764,16 @@ func (nm *networkManager) SetIfaceRoutes(ctx context.Context, iface string, rout
 		}
 	}
 
-	// Get connections from NM.
-	connections, err := nm.config.ListConnections()
+	// Find the connections that configure the interface.
+	targets, err := nm.connectionsFor(ctx, iface)
 	if err != nil {
 		return err
 	}
 
 	var errs []error
 
-	// Find the connections that has the interfaces.
-	for _, c := range connections {
-		// Get the settings of the connection.
-		var settings gonetworkmanager.ConnectionSettings
-		settings, err = c.GetSettings()
-		if err != nil {
-			return err
-		}
-
-		// Get the interface name.
-		name, ok := settings["connection"]["interface-name"].(string)
-		if !ok {
-			continue
-		}
-		if name != iface {
-			continue
-		}
-
-		// Get the interface id.
-		id, ok := settings["connection"]["id"].(string)
-		if !ok {
-			err = fmt.Errorf("failed to get interface id")
-			return
-		}
+	for _, t := range targets {
+		id := t.ID
 
 		// Update routes.
 		_, err = runCommand(ctx, "nmcli", "connection", "modify", id, "ipv4.routes", strings.Join(routes4, ","))
@@ -699,38 +807,16 @@ func (nm *networkManager) SetIfaceDNS(ctx context.Context, iface string, servers
 	}
 	search := strings.Join(searchDomains, ",")
 
-	// Get connections from NM.
-	connections, err := nm.config.ListConnections()
+	// Find the connections that configure the interface.
+	targets, err := nm.connectionsFor(ctx, iface)
 	if err != nil {
 		return err
 	}
 
 	var errs []error
 
-	// Find the connections that has the interfaces.
-	for _, c := range connections {
-		// Get the settings of the connection.
-		var settings gonetworkmanager.ConnectionSettings
-		settings, err = c.GetSettings()
-		if err != nil {
-			return err
-		}
-
-		// Get the interface name.
-		name, ok := settings["connection"]["interface-name"].(string)
-		if !ok {
-			continue
-		}
-		if name != iface {
-			continue
-		}
-
-		// Get the interface id.
-		id, ok := settings["connection"]["id"].(string)
-		if !ok {
-			err = fmt.Errorf("failed to get interface id")
-			return
-		}
+	for _, t := range targets {
+		id := t.ID
 
 		// Update DNS servers and search domains for each family. Also disable
 		// automatic DNS from DHCP/RA so the static servers are the only

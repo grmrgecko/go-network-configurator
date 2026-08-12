@@ -443,3 +443,87 @@ func TestNMDNSParsing(t *testing.T) {
 	assert.Emptyf(t, nmNameservers(map[string]any{}), "empty group dns, want empty")
 	assert.Emptyf(t, nmSearchDomains(map[string]any{}), "empty group dns-search, want empty")
 }
+
+// nmConn builds a profile for the matching tests. An empty interface name or
+// mac leaves that property off the profile entirely, the way NetworkManager
+// reports one that is not bound by it.
+func nmConn(id, uuid, iface, mac string) nmTarget {
+	conn := map[string]any{"id": id, "uuid": uuid}
+	if iface != "" {
+		conn["interface-name"] = iface
+	}
+	ethernet := map[string]any{}
+	if mac != "" {
+		ethernet["mac-address"] = []byte(parseMAC(mac))
+	}
+	return nmTarget{ID: id, Settings: gonetworkmanager.ConnectionSettings{
+		"connection":     conn,
+		"802-3-ethernet": ethernet,
+	}}
+}
+
+func parseMAC(s string) net.HardwareAddr {
+	mac, _ := net.ParseMAC(s)
+	return mac
+}
+
+// A profile that names the interface is bound to it, and is the whole answer
+// when one exists.
+func TestMatchByIfaceName(t *testing.T) {
+	all := []nmTarget{
+		nmConn("eth0", "uuid-eth0", "eth0", ""),
+		nmConn("eth1", "uuid-eth1", "eth1", ""),
+		nmConn("Wired connection 1", "uuid-wired", "", "52:54:00:34:7a:66"),
+	}
+	matched := matchByIfaceName(all, "eth0")
+	require.Len(t, matched, 1)
+	assert.Equal(t, "eth0", matched[0].ID)
+
+	assert.Empty(t, matchByIfaceName(all, "eth2"))
+}
+
+// The fallback covers the profiles a device runs without being named by one:
+// NetworkManager's default wired connection, and a profile pinned to the
+// device's hardware address.
+func TestMatchByDevice(t *testing.T) {
+	wired := nmConn("Wired connection 1", "uuid-wired", "", "")
+	pinned := nmConn("static", "uuid-static", "", "52:54:00:34:7A:66")
+	other := nmConn("eth1", "uuid-eth1", "eth1", "52:54:00:34:7a:66")
+	all := []nmTarget{wired, pinned, other}
+
+	// The active profile matches even though it names nothing.
+	matched := matchByDevice(all, "uuid-wired", "")
+	require.Len(t, matched, 1)
+	assert.Equal(t, "Wired connection 1", matched[0].ID)
+
+	// A profile pinned to the device's address matches, case-insensitively.
+	matched = matchByDevice(all, "", "52:54:00:34:7a:66")
+	require.Len(t, matched, 1)
+	assert.Equal(t, "static", matched[0].ID)
+
+	// Both identifiers together match each profile once.
+	matched = matchByDevice(all, "uuid-wired", "52:54:00:34:7a:66")
+	require.Len(t, matched, 2)
+
+	// A profile bound to another interface by name is never a candidate, and
+	// identifiers that could not be resolved match nothing rather than
+	// everything.
+	assert.Empty(t, matchByDevice(all, "", ""))
+}
+
+// The hardware address a profile is pinned to is read from either the byte
+// array D-Bus reports or the printed form a keyfile can surface.
+func TestNMSettingsMAC(t *testing.T) {
+	bytes := gonetworkmanager.ConnectionSettings{
+		"802-3-ethernet": {"mac-address": []byte(parseMAC("52:54:00:34:7a:66"))},
+	}
+	assert.Equal(t, "52:54:00:34:7a:66", nmSettingsMAC(bytes))
+
+	printed := gonetworkmanager.ConnectionSettings{
+		"802-3-ethernet": {"mac-address": "52:54:00:34:7a:66"},
+	}
+	assert.Equal(t, "52:54:00:34:7a:66", nmSettingsMAC(printed))
+
+	assert.Empty(t, nmSettingsMAC(gonetworkmanager.ConnectionSettings{"connection": {"id": "x"}}))
+	assert.Empty(t, nmSettingsMAC(gonetworkmanager.ConnectionSettings{"802-3-ethernet": {"mac-address": []byte{}}}))
+}
