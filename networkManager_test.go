@@ -527,3 +527,51 @@ func TestNMSettingsMAC(t *testing.T) {
 	assert.Empty(t, nmSettingsMAC(gonetworkmanager.ConnectionSettings{"connection": {"id": "x"}}))
 	assert.Empty(t, nmSettingsMAC(gonetworkmanager.ConnectionSettings{"802-3-ethernet": {"mac-address": []byte{}}}))
 }
+
+// NetworkManager leaves the unset keys out of a route-data entry rather than
+// sending zero values: no "metric" for a route on the device's default metric,
+// no "next-hop" for an on-link route. cloud-init's profile on AlmaLinux 10
+// (NetworkManager 1.54) has such a route, and parsing it panicked on the
+// missing metric.
+// A truncated old-style tuple must be skipped the same way, not indexed past.
+func TestNMParseConnectionToleratesOmittedKeys(t *testing.T) {
+	nm := new(networkManager)
+	conn, err := nm.ParseConnection(gonetworkmanager.ConnectionSettings{
+		"connection": {"id": "cloud-init eth0", "interface-name": "eth0"},
+		"ipv4": {
+			"method":       "manual",
+			"gateway":      "50.28.84.1",
+			"address-data": []map[string]any{{"address": "50.28.84.42", "prefix": uint32(24)}},
+			"route-data": []map[string]any{
+				{"dest": "10.0.0.0", "prefix": uint32(8), "next-hop": "50.28.84.1"},
+				{"dest": "169.254.169.254", "prefix": uint32(32)},
+				{"prefix": uint32(16)},
+			},
+		},
+		"ipv6": {
+			"method":       "auto",
+			"address-data": []map[string]any{{"address": "2001:db8::42"}},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Len(t, conn.Addresses4, 1)
+	assert.Equal(t, "50.28.84.42/24", conn.Addresses4[0].String(), "the address must parse")
+	assert.Empty(t, conn.Addresses6, "an address without a prefix does not describe one")
+
+	require.Len(t, conn.Routes4, 2, "a route without a destination is skipped and the rest kept")
+	assert.Equal(t, "10.0.0.0/8 via 50.28.84.1 metric 0", conn.Routes4[0].String(), "a route without a metric uses metric 0")
+	assert.Equal(t, "169.254.169.254/32", conn.Routes4[1].Destination.String(), "an on-link route must parse")
+	assert.Nil(t, conn.Routes4[1].Gateway, "an on-link route has no next hop")
+
+	legacy, err := nm.ParseConnection(gonetworkmanager.ConnectionSettings{
+		"connection": {"id": "legacy"},
+		"ipv4": {
+			"addresses": [][]uint32{{ip2Uint(net.ParseIP("192.0.2.5")), 24}},
+			"routes":    [][]uint32{{ip2Uint(net.ParseIP("198.51.100.0")), 24, 0}},
+		},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, legacy.Addresses4, "an address tuple without its gateway field is skipped")
+	assert.Empty(t, legacy.Routes4, "a route tuple without its metric field is skipped")
+}

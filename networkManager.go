@@ -103,6 +103,52 @@ func nmSearchDomains(group map[string]any) []string {
 	return nil
 }
 
+// nmAddressData reads an address-data list, a map per address holding its
+// "address" and "prefix". An entry missing either does not describe an address
+// and is skipped rather than failing the whole profile.
+func nmAddressData(value any, bits int) []*net.IPNet {
+	entries, _ := value.([]map[string]any)
+	var addrs []*net.IPNet
+	for _, entry := range entries {
+		address, _ := entry["address"].(string)
+		prefix, ok := entry["prefix"].(uint32)
+		ip := net.ParseIP(address)
+		if ip == nil || !ok {
+			continue
+		}
+		addrs = append(addrs, &net.IPNet{IP: ip, Mask: net.CIDRMask(int(prefix), bits)})
+	}
+	return addrs
+}
+
+// nmRouteData reads a route-data list, a map per route. NetworkManager leaves
+// out the keys a route does not set: "next-hop" for an on-link route and
+// "metric" for one on the device's default metric, which read as no gateway
+// and metric 0. An entry without "dest" and "prefix" does not describe a route
+// and is skipped.
+func nmRouteData(value any, bits int) []*Route {
+	entries, _ := value.([]map[string]any)
+	var routes []*Route
+	for _, entry := range entries {
+		dest, _ := entry["dest"].(string)
+		prefix, ok := entry["prefix"].(uint32)
+		dstIP := net.ParseIP(dest)
+		if dstIP == nil || !ok {
+			continue
+		}
+		r := new(Route)
+		r.Destination = &net.IPNet{IP: dstIP, Mask: net.CIDRMask(int(prefix), bits)}
+		if nextHop, ok := entry["next-hop"].(string); ok {
+			r.Gateway = net.ParseIP(nextHop)
+		}
+		if metric, ok := entry["metric"].(uint32); ok {
+			r.Metric = int(metric)
+		}
+		routes = append(routes, r)
+	}
+	return routes
+}
+
 // Parse a network manager connection settings map to get network configurations.
 func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSettings) (conn *nmConnection, err error) {
 	conn = new(nmConnection)
@@ -133,18 +179,7 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 		conn.UsingData = true
 
 		// Parse the IPv4 address data into the address list.
-		if addrMap != nil {
-			addrSlice := addrMap.([]map[string]any)
-			for _, addr := range addrSlice {
-				ip := net.ParseIP(addr["address"].(string))
-				prefix := addr["prefix"].(uint32)
-				conn.Addresses4 = append(conn.Addresses4, &net.IPNet{
-					IP:   ip,
-					Mask: net.CIDRMask(int(prefix), 32),
-				})
-
-			}
-		}
+		conn.Addresses4 = nmAddressData(addrMap, 32)
 
 		// Parse the IPv4 gateway.
 		gateway4S, ok := settings["ipv4"]["gateway"].(string)
@@ -153,19 +188,7 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 		}
 
 		// Parse the IPv6 addresses.
-		addr6Map, ok := settings["ipv6"]["address-data"]
-		if ok && addr6Map != nil {
-			addrSlice := addr6Map.([]map[string]any)
-			for _, addr := range addrSlice {
-				ip := net.ParseIP(addr["address"].(string))
-				prefix := addr["prefix"].(uint32)
-				conn.Addresses6 = append(conn.Addresses6, &net.IPNet{
-					IP:   ip,
-					Mask: net.CIDRMask(int(prefix), 128),
-				})
-
-			}
-		}
+		conn.Addresses6 = nmAddressData(settings["ipv6"]["address-data"], 128)
 
 		// Parse the IPv6 gateway.
 		gateway6S, ok := settings["ipv6"]["gateway"].(string)
@@ -173,43 +196,9 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 			conn.Gateway6 = net.ParseIP(gateway6S)
 		}
 
-		// Parse the IPv4 static route data.
-		routeMap, ok := settings["ipv4"]["route-data"]
-		if ok && routeMap != nil {
-			routeSlice := routeMap.([]map[string]any)
-			for _, route := range routeSlice {
-				dstIP := net.ParseIP(route["dest"].(string))
-				prefix := route["prefix"].(uint32)
-				r := new(Route)
-				r.Destination = &net.IPNet{
-					IP:   dstIP,
-					Mask: net.CIDRMask(int(prefix), 32),
-				}
-				r.Gateway = net.ParseIP(route["next-hop"].(string))
-				r.Metric = int(route["metric"].(uint32))
-				conn.Routes4 = append(conn.Routes4, r)
-
-			}
-		}
-
-		// Parse the IPv6 static route data.
-		route6Map, ok := settings["ipv6"]["route-data"]
-		if ok && route6Map != nil {
-			routeSlice := route6Map.([]map[string]any)
-			for _, route := range routeSlice {
-				dstIP := net.ParseIP(route["dest"].(string))
-				prefix := route["prefix"].(uint32)
-				r := new(Route)
-				r.Destination = &net.IPNet{
-					IP:   dstIP,
-					Mask: net.CIDRMask(int(prefix), 128),
-				}
-				r.Gateway = net.ParseIP(route["next-hop"].(string))
-				r.Metric = int(route["metric"].(uint32))
-				conn.Routes6 = append(conn.Routes6, r)
-
-			}
-		}
+		// Parse the static route data of each family.
+		conn.Routes4 = nmRouteData(settings["ipv4"]["route-data"], 32)
+		conn.Routes6 = nmRouteData(settings["ipv6"]["route-data"], 128)
 	} else {
 		// This is the old style configuration, we do not parse
 		// these unless the new style is missing.
@@ -219,10 +208,14 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 		zeroIP := make(net.IP, 4)
 		zeroIP6 := make(net.IP, 16)
 
-		// Parse IPv4 address slices.
+		// Parse IPv4 address slices. Each is (address, prefix, gateway); one
+		// shorter than that does not describe an address and is skipped.
 		addrSlice, ok := settings["ipv4"]["addresses"].([][]uint32)
 		if ok {
 			for _, addr := range addrSlice {
+				if len(addr) < 3 {
+					continue
+				}
 				gateway := uint2IP(addr[2])
 				if gateway != nil && !gateway.Equal(zeroIP) {
 					conn.Gateway4 = gateway
@@ -234,25 +227,37 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 			}
 		}
 
-		// Parse IPv6 address slices.
+		// Parse IPv6 address slices, (address, prefix, gateway) the same way.
 		addr6Slice, ok := settings["ipv6"]["addresses"].([][]any)
 		if ok {
 			for _, addr := range addr6Slice {
-				gateway := net.IP(addr[2].([]byte))
-				if gateway != nil && !gateway.Equal(zeroIP6) {
-					conn.Gateway6 = gateway
+				if len(addr) < 3 {
+					continue
+				}
+				ip, ipOK := addr[0].([]byte)
+				prefix, prefixOK := addr[1].(uint32)
+				if !ipOK || !prefixOK {
+					continue
+				}
+				gateway, _ := addr[2].([]byte)
+				if gateway != nil && !net.IP(gateway).Equal(zeroIP6) {
+					conn.Gateway6 = net.IP(gateway)
 				}
 				conn.Addresses6 = append(conn.Addresses6, &net.IPNet{
-					IP:   net.IP(addr[0].([]byte)),
-					Mask: net.CIDRMask(int(addr[1].(uint32)), 128),
+					IP:   net.IP(ip),
+					Mask: net.CIDRMask(int(prefix), 128),
 				})
 			}
 		}
 
-		// Parse IPv4 static routes.
+		// Parse IPv4 static routes. Each is (destination, prefix, next hop,
+		// metric); one shorter than that is skipped.
 		routeSlice, ok := settings["ipv4"]["routes"].([][]uint32)
 		if ok {
 			for _, route := range routeSlice {
+				if len(route) < 4 {
+					continue
+				}
 				r := new(Route)
 				r.Destination = &net.IPNet{
 					IP:   uint2IP(route[0]),
@@ -264,17 +269,27 @@ func (*networkManager) ParseConnection(settings gonetworkmanager.ConnectionSetti
 			}
 		}
 
-		// Parse IPv6 static routes.
+		// Parse IPv6 static routes, the same four fields.
 		route6Slice, ok := settings["ipv6"]["routes"].([][]any)
 		if ok {
 			for _, route := range route6Slice {
+				if len(route) < 4 {
+					continue
+				}
+				dest, destOK := route[0].([]byte)
+				prefix, prefixOK := route[1].(uint32)
+				if !destOK || !prefixOK {
+					continue
+				}
 				r := new(Route)
 				r.Destination = &net.IPNet{
-					IP:   net.IP(route[0].([]byte)),
-					Mask: net.CIDRMask(int(route[1].(uint32)), 128),
+					IP:   net.IP(dest),
+					Mask: net.CIDRMask(int(prefix), 128),
 				}
-				r.Gateway = net.IP(route[2].([]byte))
-				r.Metric = int(route[3].(uint32))
+				gateway, _ := route[2].([]byte)
+				r.Gateway = net.IP(gateway)
+				metric, _ := route[3].(uint32)
+				r.Metric = int(metric)
 				conn.Routes6 = append(conn.Routes6, r)
 			}
 		}
