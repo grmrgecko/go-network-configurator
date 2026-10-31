@@ -217,6 +217,54 @@ type cloudInit struct {
 	backupRetention int       `yaml:"-" json:"-"`
 }
 
+// unmarshalCloudConfig decodes a cloud-init YAML file into a map the way
+// cloud-init reads it. cloud-init loads YAML with PyYAML, which keeps the last
+// value of a repeated mapping key, while yaml.v3 rejects the document outright.
+// Debian 13's stock /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg repeats sudo and
+// shell under system_info.default_user, so a strict decode would drop the whole
+// cloud-init backend on every Debian 13 host.
+func unmarshalCloudConfig(data []byte, config *map[string]any) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+
+	// An empty file decodes to a zero node and holds no configuration.
+	if doc.Kind == 0 {
+		return nil
+	}
+
+	dedupeMappingKeys(&doc)
+	return doc.Decode(config)
+}
+
+// dedupeMappingKeys removes all but the last occurrence of each scalar key in
+// every mapping under node, matching PyYAML's last-key-wins behavior.
+func dedupeMappingKeys(node *yaml.Node) {
+	if node.Kind == yaml.MappingNode {
+		last := make(map[string]int)
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if key := node.Content[i]; key.Kind == yaml.ScalarNode {
+				last[key.Value] = i
+			}
+		}
+
+		content := make([]*yaml.Node, 0, len(node.Content))
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if key.Kind == yaml.ScalarNode && last[key.Value] != i {
+				continue
+			}
+			content = append(content, key, node.Content[i+1])
+		}
+		node.Content = content
+	}
+
+	for _, child := range node.Content {
+		dedupeMappingKeys(child)
+	}
+}
+
 // Find cloud-init and cloudbase-init network configurations.
 func newCloudInit(backupRetention int) (ci *cloudInit, err error) {
 	ci, err = newCloudInitWith(cloudInitDefault, cloudBaseInit, cloudInitDir)
@@ -287,10 +335,10 @@ func newCloudInitWith(cloudinitFile, cloudbaseFile, cloudinitDir string) (ci *cl
 
 			}
 		} else {
-			err = yaml.Unmarshal(data, &config)
+			err = unmarshalCloudConfig(data, &config)
 		}
 		if err != nil {
-			return
+			return nil, fmt.Errorf("parsing %s: %w", configFile, err)
 		}
 
 		// Determine if this config only contains network configs.
@@ -743,7 +791,7 @@ func (ci *cloudInit) Save() error {
 		if strings.HasSuffix(configPath, ".json") {
 			err = json.Unmarshal(data, &origConfig)
 		} else {
-			err = yaml.Unmarshal(data, &origConfig)
+			err = unmarshalCloudConfig(data, &origConfig)
 		}
 		if err != nil {
 			return err

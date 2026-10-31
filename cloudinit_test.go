@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -216,4 +217,44 @@ func TestCloudbaseinit(t *testing.T) {
 	// Cleanup.
 	err = os.RemoveAll(tmpDir)
 	require.NoError(t, err)
+}
+
+// TestCloudinitDuplicateKeys locks in reading cloud-init configuration the way
+// cloud-init's PyYAML loader does: a repeated mapping key keeps its last value
+// instead of failing the file. The fixture is /etc/cloud/cloud.cfg.d/01_debian_cloud.cfg
+// captured from a Debian 13 (trixie) MAAS host running cloud-init 23.1.2. It
+// repeats sudo and shell under system_info.default_user, and a strict decode of
+// it used to drop the whole cloud-init backend on every Debian 13 host.
+func TestCloudinitDuplicateKeys(t *testing.T) {
+	debianCfg, err := filepath.Abs("./tests/cloudinit/debian13/01_debian_cloud.cfg")
+	require.NoError(t, err)
+
+	t.Run("later duplicate key wins", func(t *testing.T) {
+		data, err := os.ReadFile(debianCfg)
+		require.NoError(t, err)
+
+		var config map[string]any
+		require.NoError(t, unmarshalCloudConfig(data, &config))
+
+		user := config["system_info"].(map[string]any)["default_user"].(map[string]any)
+		assert.Equal(t, []any{"ALL=(ALL) NOPASSWD:ALL"}, user["sudo"],
+			"the second sudo entry, a list, must replace the first, a string, as PyYAML does")
+		assert.Equal(t, "debian", user["name"], "keys that are not repeated must be kept")
+	})
+
+	t.Run("backend loads with the Debian file in cloud.cfg.d", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		configPath := filepath.Join(tmpDir, "cloud.cfg")
+		require.NoError(t, fileCopy("./tests/cloudinit/network.yaml", configPath))
+		cfgDir := filepath.Join(tmpDir, "cloud.cfg.d")
+		require.NoError(t, os.Mkdir(cfgDir, 0755))
+		require.NoError(t, fileCopy(debianCfg, filepath.Join(cfgDir, "01_debian_cloud.cfg")))
+
+		ci, err := newCloudInitWith(configPath, filepath.Join(tmpDir, "nothing.json"), cfgDir)
+		require.NoError(t, err, "a repeated key in a file without network config must not disable cloud-init")
+
+		interfaces, err := ci.GetInterfaces()
+		require.NoError(t, err)
+		assert.NotEmpty(t, interfaces, "the network config in cloud.cfg must still be read")
+	})
 }
