@@ -200,26 +200,39 @@ func readNetworkdConfigDirectory(dirPath string) (nd *networkd, err error) {
 		}
 
 		// If the name wasn't in the match section, try finding
-		// by MAC address.'
+		// by MAC address.
 		if name == "" {
-			// Get the MAC address from the match section.
-			var macAddr string
+			// Get the MAC addresses from the match section, which networkd
+			// accepts as a space separated list.
+			var macAddrs []string
 			macKey, _ := match.GetKey("MACAddress")
 			if macKey != nil {
-				macAddr = macKey.String()
+				macAddrs = strings.Fields(macKey.String())
 			}
 
-			// Try parsing the MAC.
-			mac, err = net.ParseMAC(macAddr)
-			if err != nil {
-				return nil, fmt.Errorf("unable to parse mac address %s: %v", macAddr, err)
+			// A file matching neither a name nor a MAC address, such as the
+			// catch-all DHCP default dracut writes, configures no single
+			// interface, so it is not one of ours to manage.
+			if len(macAddrs) == 0 {
+				continue
 			}
 
-			// Find the matching link.
-			for _, link := range links {
-				if bytes.Equal(link.Attrs().HardwareAddr, mac) {
-					foundLink = link
-					name = link.Attrs().Name
+			// Parse each MAC and find the link holding one of them.
+			for _, macAddr := range macAddrs {
+				var parsed net.HardwareAddr
+				parsed, err = net.ParseMAC(macAddr)
+				if err != nil {
+					return nil, fmt.Errorf("unable to parse mac address %s: %v", macAddr, err)
+				}
+				if mac == nil {
+					mac = parsed
+				}
+				for _, link := range links {
+					if bytes.Equal(link.Attrs().HardwareAddr, parsed) {
+						foundLink = link
+						mac = parsed
+						name = link.Attrs().Name
+					}
 				}
 			}
 		}
