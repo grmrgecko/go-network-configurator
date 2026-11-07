@@ -84,6 +84,19 @@ func ipAdapterAddresses(ipAdapter *winipcfg.IPAdapterAddresses) (addresses []*ne
 	for unicast != nil {
 		addr := unicast.Address.IP()
 
+		// Windows records each address's own prefix length. The adapter's prefix list below
+		// leaves out host-length prefixes, so an address added as a /32 or /128 would otherwise
+		// never be found, and the address would be missing from the interface.
+		bits := 32
+		if addr.To4() == nil {
+			bits = 128
+		}
+		if length := int(unicast.OnLinkPrefixLength); length > 0 && length <= bits {
+			addresses = append(addresses, &net.IPNet{IP: addr, Mask: net.CIDRMask(length, bits)})
+			unicast = unicast.Next
+			continue
+		}
+
 		// Check prefixes on the adapter to find the prefix for
 		// this address.
 		prefix := ipAdapter.FirstPrefix
@@ -311,25 +324,13 @@ func (c *windowsConfigurator) AddAddress(ctx context.Context, iface string, addr
 	exists := false
 	var origAddr *net.IPNet
 	addresses := ipAdapterAddresses(ipAdapter)
-	var prefixes []netip.Prefix
 	for a, address := range addresses {
 		// If the address already exists, update the netmask.
 		if address.IP.Equal(addr.IP) {
 			origAddr = address
 			exists = true
-			address = addr
 			addresses[a] = addr
 		}
-
-		// Add to prefix list.
-		ones, _ := address.Mask.Size()
-		var ip netip.Addr
-		if address.IP.To4() != nil {
-			ip = netip.AddrFrom4([4]byte(address.IP.To4()))
-		} else {
-			ip = netip.AddrFrom16([16]byte(address.IP.To16()))
-		}
-		prefixes = append(prefixes, netip.PrefixFrom(ip, ones))
 	}
 
 	// Add if not already existing.
@@ -338,22 +339,21 @@ func (c *windowsConfigurator) AddAddress(ctx context.Context, iface string, addr
 			return fmt.Errorf("the ip we are adding is responding to ping")
 		}
 		addresses = append(addresses, addr)
-
-		// Add to prefix list.
-		ones, _ := addr.Mask.Size()
-		var ip netip.Addr
-		if addr.IP.To4() != nil {
-			ip = netip.AddrFrom4([4]byte(addr.IP.To4()))
-		} else {
-			ip = netip.AddrFrom16([16]byte(addr.IP.To16()))
-		}
-		prefixes = append(prefixes, netip.PrefixFrom(ip, ones))
 	}
 
-	// Set the IP addresses on the interface.
-	err = ipAdapter.LUID.SetIPAddresses(prefixes)
-	if err != nil {
-		return err
+	// Add only this address, replacing it when its prefix changed. SetIPAddresses flushes every
+	// address and adds them back, which drops the server's own address, and every connection
+	// to it, for a moment.
+	changed := !exists || origAddr.String() != addr.String()
+	if exists && changed {
+		if err = ipAdapter.LUID.DeleteIPAddress(prefixOf(origAddr)); err != nil {
+			return err
+		}
+	}
+	if changed {
+		if err = ipAdapter.LUID.AddIPAddress(prefixOf(addr)); err != nil {
+			return err
+		}
 	}
 
 	// Find the default gateway, and update or remove based on config.
@@ -441,36 +441,16 @@ func (c *windowsConfigurator) AddAddress(ctx context.Context, iface string, addr
 		// The check (and rollback) is skipped when connectivity verification
 		// is disabled.
 		if !c.skipConnectivityCheck && !testInternet(ctx, c.testAddress, c.connectivityTimeout) {
-			// Attempt to restore the original IP list. Rebuild the prefix
-			// list in place (rather than shadowing the outer prefixes) from
-			// the restored addresses, dropping the newly added address.
-			prefixes = nil
-			for a, address := range addresses {
-				if address.IP.Equal(addr.IP) {
-					// If the address did not exist before the change, drop it
-					// on rollback rather than restoring a stale value.
-					if !exists {
-						continue
+			// Restore the original address, touching no other.
+			if changed {
+				if err = ipAdapter.LUID.DeleteIPAddress(prefixOf(addr)); err != nil {
+					return err
+				}
+				if exists {
+					if err = ipAdapter.LUID.AddIPAddress(prefixOf(origAddr)); err != nil {
+						return err
 					}
-					address = origAddr
-					addresses[a] = origAddr
 				}
-
-				// Add to prefix list.
-				ones, _ := address.Mask.Size()
-				var ip netip.Addr
-				if address.IP.To4() != nil {
-					ip = netip.AddrFrom4([4]byte(address.IP.To4()))
-				} else {
-					ip = netip.AddrFrom16([16]byte(address.IP.To16()))
-				}
-				prefixes = append(prefixes, netip.PrefixFrom(ip, ones))
-			}
-
-			// Restore original addresses.
-			err = ipAdapter.LUID.SetIPAddresses(prefixes)
-			if err != nil {
-				return err
 			}
 
 			// Try and restore the original gateway.
@@ -522,6 +502,11 @@ func (c *windowsConfigurator) AddAddress(ctx context.Context, iface string, addr
 	}
 
 	return nil
+}
+
+// prefixOf converts one address to the netip.Prefix winipcfg takes.
+func prefixOf(address *net.IPNet) netip.Prefix {
+	return prefixesFromAddresses([]*net.IPNet{address})[0]
 }
 
 // prefixesFromAddresses converts a list of addresses to the netip.Prefix list
@@ -756,8 +741,16 @@ func (c *windowsConfigurator) RemoveAddress(ctx context.Context, iface string, a
 		return fmt.Errorf("unable to reach gateway after removing address.")
 	}
 
-	// Set the IP addresses on the interface.
-	err = ipAdapter.LUID.SetIPAddresses(prefixesFromAddresses(addresses))
+	// Delete only this address, with the prefix it has on the adapter. SetIPAddresses flushes
+	// every address and adds the rest back, which drops the server's own address, and every
+	// connection to it, for a moment.
+	target := addr
+	for _, address := range origAddresses {
+		if address.IP.Equal(addr.IP) {
+			target = address
+		}
+	}
+	err = ipAdapter.LUID.DeleteIPAddress(prefixOf(target))
 	if err != nil {
 		return err
 	}
@@ -772,7 +765,7 @@ func (c *windowsConfigurator) RemoveAddress(ctx context.Context, iface string, a
 			pingTest(ctx, gw.String(), c.pingCount, c.pingTimeout)
 		}
 		if !testInternet(ctx, c.testAddress, c.connectivityTimeout) {
-			if rerr := ipAdapter.LUID.SetIPAddresses(prefixesFromAddresses(origAddresses)); rerr != nil {
+			if rerr := ipAdapter.LUID.AddIPAddress(prefixOf(target)); rerr != nil {
 				return rerr
 			}
 			return fmt.Errorf("removing address %s broke internet connectivity; address restored", addr.IP.String())
