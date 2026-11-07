@@ -459,3 +459,12 @@ func prefixBackupMatcher(base string) func(string) bool {
 		return strings.HasPrefix(name, ".bak.") && strings.HasSuffix(name, "."+base)
 	}
 }
+
+// configFileMode returns the mode a rewritten configuration file keeps: the current file's, so
+// a file that was private stays private, or fallback for a new file.
+func configFileMode(path string, fallback os.FileMode) os.FileMode {
+	if info, err := os.Stat(path); err == nil {
+		return info.Mode().Perm()
+	}
+	return fallback
+}

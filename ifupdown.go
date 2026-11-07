@@ -891,7 +891,14 @@ func (iface *ifInterface) Save(backupDir string, backupRetention int) error {
 		bakPath := path.Join(backupDir, bak)
 
 		// Open tmp file for writing.
-		fdw, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE, 0644)
+		mode := configFileMode(filePath, 0644)
+		fdw, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE, mode)
+		if err == nil {
+			// OpenFile's mode passes through the umask.
+			if err = fdw.Chmod(mode); err != nil {
+				fdw.Close()
+			}
+		}
 		if err != nil {
 			return err
 		}

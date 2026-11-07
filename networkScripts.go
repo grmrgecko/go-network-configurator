@@ -641,7 +641,14 @@ func (n *nsInterface) Save(config map[string]string, configDir string, backupRet
 	tmpPath := path.Join(configDir, tmpName)
 
 	// Try to encode/save the config.
-	fd, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE, 0644)
+	mode := configFileMode(configPath, 0644)
+	fd, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE, mode)
+	if err == nil {
+		// OpenFile's mode passes through the umask.
+		if err = fd.Chmod(mode); err != nil {
+			fd.Close()
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -702,7 +709,14 @@ func (n *nsInterface) SaveRouteFiles(routes4 []string, routes6 []string, configD
 
 	// Try to encode/save the config.
 	if len(routes4) != 0 {
-		fd, err := os.OpenFile(tmp4Path, os.O_WRONLY|os.O_CREATE, 0644)
+		mode := configFileMode(config4Path, 0644)
+		fd, err := os.OpenFile(tmp4Path, os.O_WRONLY|os.O_CREATE, mode)
+		if err == nil {
+			// OpenFile's mode passes through the umask.
+			if err = fd.Chmod(mode); err != nil {
+				fd.Close()
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -720,7 +734,14 @@ func (n *nsInterface) SaveRouteFiles(routes4 []string, routes6 []string, configD
 
 	// Try to encode/save the config.
 	if len(routes6) != 0 {
-		fd, err := os.OpenFile(tmp6Path, os.O_WRONLY|os.O_CREATE, 0644)
+		mode := configFileMode(config6Path, 0644)
+		fd, err := os.OpenFile(tmp6Path, os.O_WRONLY|os.O_CREATE, mode)
+		if err == nil {
+			// OpenFile's mode passes through the umask.
+			if err = fd.Chmod(mode); err != nil {
+				fd.Close()
+			}
+		}
 		if err != nil {
 			return err
 		}

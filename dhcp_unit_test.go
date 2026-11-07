@@ -658,6 +658,23 @@ func (f *fakeRenewerBackend) renewDHCP(_ context.Context, iface string) error {
 	return f.renewErr
 }
 
+// A rewritten netplan file must keep the mode it had. Netplan warns about, and readers can see
+// secrets in, a file other users can read, and rewriting one used to leave it 0644.
+func TestNetplanSaveKeepsFileMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "50-cloud-init.yaml")
+	config := "network:\n  version: 2\n  ethernets:\n    eth0:\n      addresses:\n        - 1.2.3.4/24\n"
+	require.NoError(t, os.WriteFile(path, []byte(config), 0600))
+
+	np, err := readNetplanConfigDirectory(dir)
+	require.NoError(t, err)
+	require.NoError(t, np.SetIfaceDHCP(context.Background(), "eth0", true, false))
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+}
+
 // Addresses rewritten into an ifcfg file must keep the default gateway readable by
 // NetworkManager's ifcfg-rh plugin, which ignores an unnumbered GATEWAY once the first address is
 // IPADDR0. Adding then removing an address on CentOS 7 used to leave the server without a route.

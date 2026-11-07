@@ -634,7 +634,12 @@ func (np *netplan) Save() error {
 			if err != nil {
 				return err
 			}
-			err = os.WriteFile(tmpPath, data, 0644)
+			mode := configFileMode(path.Join(np.configDir, config.file), 0600)
+			err = os.WriteFile(tmpPath, data, mode)
+			if err == nil {
+				// WriteFile's mode passes through the umask.
+				err = os.Chmod(tmpPath, mode)
+			}
 			if err != nil {
 				return err
 			}

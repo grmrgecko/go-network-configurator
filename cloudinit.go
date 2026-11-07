@@ -825,7 +825,12 @@ func (ci *cloudInit) Save() error {
 		if err != nil {
 			return err
 		}
-		err = os.WriteFile(tmpPath, data, 0644)
+		mode := configFileMode(configPath, 0644)
+		err = os.WriteFile(tmpPath, data, mode)
+		if err == nil {
+			// WriteFile's mode passes through the umask.
+			err = os.Chmod(tmpPath, mode)
+		}
 		if err != nil {
 			return err
 		}
