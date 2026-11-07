@@ -838,13 +838,19 @@ func (ns *networkScripts) SetIfaceAddresses(_ context.Context, iface string, add
 		delete(config, fmt.Sprintf("ARPUPDATE%s", idx))
 	}
 
-	// Add IP addresses.
+	// Add IP addresses. The first is unnumbered and the rest count from 1, as cloud-init and
+	// NetworkManager write them: NetworkManager's ifcfg-rh plugin ignores an unnumbered GATEWAY
+	// once the first address is IPADDR0, which leaves the server without a default route.
 	for idx, ip := range addrs4 {
-		config[fmt.Sprintf("IPADDR%d", idx)] = ip.IP.String()
+		suffix := strconv.Itoa(idx)
+		if idx == 0 {
+			suffix = ""
+		}
+		config["IPADDR"+suffix] = ip.IP.String()
 		prefix, _ := ip.Mask.Size()
-		config[fmt.Sprintf("PREFIX%d", idx)] = strconv.Itoa(prefix)
-		config[fmt.Sprintf("NETMASK%d", idx)] = net.IP(ip.Mask).String()
-		config[fmt.Sprintf("BROADCAST%d", idx)] = getBroadcast(ip).String()
+		config["PREFIX"+suffix] = strconv.Itoa(prefix)
+		config["NETMASK"+suffix] = net.IP(ip.Mask).String()
+		config["BROADCAST"+suffix] = getBroadcast(ip).String()
 	}
 
 	// Add IPv6 addresses.

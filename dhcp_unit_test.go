@@ -318,7 +318,7 @@ func TestNetworkScriptsSetIfaceDHCP(t *testing.T) {
 		config := readConfig(t, dir)
 		assert.Equal(t, "dhcp", config["BOOTPROTO"],
 			"a static address may coexist with a lease; only SetDHCP turns it off")
-		assert.Equal(t, "1.2.3.4", config["IPADDR0"])
+		assert.Equal(t, "1.2.3.4", config["IPADDR"])
 	})
 
 	t.Run("reads the state back through GetInterfaces", func(t *testing.T) {
@@ -656,4 +656,41 @@ func (f *fakeRenewerBackend) renewDHCP(_ context.Context, iface string) error {
 	f.renewCalls++
 	f.lastIface = iface
 	return f.renewErr
+}
+
+// Addresses rewritten into an ifcfg file must keep the default gateway readable by
+// NetworkManager's ifcfg-rh plugin, which ignores an unnumbered GATEWAY once the first address is
+// IPADDR0. Adding then removing an address on CentOS 7 used to leave the server without a route.
+func TestNetworkScriptsAddressesKeepGateway(t *testing.T) {
+	dir := t.TempDir()
+	body := "DEVICE=eth0.1556\nBOOTPROTO=none\nGATEWAY=72.52.139.81\nIPADDR=72.52.139.88\nNETMASK=255.255.255.240\nVLAN=yes\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ifcfg-eth0.1556"), []byte(body), 0644))
+	ns, err := newNetworkScriptsWithConfig(dir)
+	require.NoError(t, err)
+
+	read := func() map[string]string {
+		reread, err := newNetworkScriptsWithConfig(dir)
+		require.NoError(t, err)
+		require.Len(t, reread.Interfaces, 1)
+		return reread.Interfaces[0].IFFiles[0].Config
+	}
+	gw := net.ParseIP("72.52.139.81")
+
+	require.NoError(t, ns.SetIfaceAddresses(context.Background(), "eth0.1556", []*net.IPNet{cidr(t, "72.52.139.88/28"), cidr(t, "192.0.2.50/32")}, gw, nil))
+	config := read()
+	assert.Equal(t, "72.52.139.88", config["IPADDR"], "the first address is unnumbered")
+	assert.Equal(t, "192.0.2.50", config["IPADDR1"])
+	assert.NotContains(t, config, "IPADDR0")
+	assert.Equal(t, "72.52.139.81", config["GATEWAY"])
+
+	ns, err = newNetworkScriptsWithConfig(dir)
+	require.NoError(t, err)
+	require.NoError(t, ns.SetIfaceAddresses(context.Background(), "eth0.1556", []*net.IPNet{cidr(t, "72.52.139.88/28")}, gw, nil))
+	config = read()
+	assert.Equal(t, "72.52.139.88", config["IPADDR"])
+	assert.Equal(t, "28", config["PREFIX"])
+	assert.NotContains(t, config, "IPADDR0")
+	assert.NotContains(t, config, "IPADDR1")
+	assert.Equal(t, "72.52.139.81", config["GATEWAY"])
+	assert.Equal(t, "yes", config["VLAN"], "other settings survive")
 }
