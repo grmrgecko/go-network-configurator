@@ -2,11 +2,26 @@ package netconfig
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
 	"strings"
 )
+
+// ErrNotPersisted reports a change that is live on the system, with connectivity
+// verified, but that a configuration backend or control panel failed to save.
+// The running state is not rolled back, so a reboot or panel resync can undo
+// the change until the failure is fixed. The wrapped errors name each backend.
+var ErrNotPersisted = errors.New("the change is live but was not saved everywhere")
+
+// notPersisted wraps backend errors as ErrNotPersisted, or returns nil.
+func notPersisted(errs ...error) error {
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("%w: %w", ErrNotPersisted, err)
+	}
+	return nil
+}
 
 const (
 	defaultInternetTestAddress = "http://clients3.google.com/generate_204"
@@ -139,24 +154,31 @@ type namedPanelBackend struct {
 }
 
 // applyIfaceAddresses pushes the interface's address configuration to every
-// registered file backend. Individual failures are logged but do not abort
-// the others, since each backend writes an independent configuration file.
-func applyIfaceAddresses(ctx context.Context, backends []namedIfaceBackend, iface string, addrs []*net.IPNet, gateway4, gateway6 net.IP) {
+// registered file backend. Individual failures are logged and returned joined,
+// but do not abort the others, since each backend writes an independent
+// configuration file.
+func applyIfaceAddresses(ctx context.Context, backends []namedIfaceBackend, iface string, addrs []*net.IPNet, gateway4, gateway6 net.IP) error {
+	var errs []error
 	for _, b := range backends {
 		if err := b.backend.SetIfaceAddresses(ctx, iface, addrs, gateway4, gateway6); err != nil {
 			logger.Printf("%s error: %v", b.name, err)
+			errs = append(errs, fmt.Errorf("%s: %w", b.name, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // applyIfaceRoutes pushes the interface's static routes to every registered
-// file backend, logging but not aborting on individual errors.
-func applyIfaceRoutes(ctx context.Context, backends []namedIfaceBackend, iface string, routes []*Route) {
+// file backend, returning individual errors joined without aborting the others.
+func applyIfaceRoutes(ctx context.Context, backends []namedIfaceBackend, iface string, routes []*Route) error {
+	var errs []error
 	for _, b := range backends {
 		if err := b.backend.SetIfaceRoutes(ctx, iface, routes); err != nil {
 			logger.Printf("%s error: %v", b.name, err)
+			errs = append(errs, fmt.Errorf("%s: %w", b.name, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // ifaceDNSReader is an optional capability of a file backend: reading back the
@@ -280,43 +302,55 @@ func renewDHCPOnBackends(ctx context.Context, backends []namedIfaceBackend, ifac
 }
 
 // applyIfaceDNS pushes the interface's DNS servers and search domains to every
-// registered file backend, logging but not aborting on individual errors.
-func applyIfaceDNS(ctx context.Context, backends []namedIfaceBackend, iface string, servers []net.IP, searchDomains []string) {
+// registered file backend, returning individual errors joined without aborting the others.
+func applyIfaceDNS(ctx context.Context, backends []namedIfaceBackend, iface string, servers []net.IP, searchDomains []string) error {
+	var errs []error
 	for _, b := range backends {
 		if err := b.backend.SetIfaceDNS(ctx, iface, servers, searchDomains); err != nil {
 			logger.Printf("%s error: %v", b.name, err)
+			errs = append(errs, fmt.Errorf("%s: %w", b.name, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // reloadPanels tells every registered control panel to re-read the system's
-// IP addresses, logging but not aborting on individual errors.
-func reloadPanels(ctx context.Context, backends []namedPanelBackend) {
+// IP addresses, returning individual errors joined without aborting the others.
+func reloadPanels(ctx context.Context, backends []namedPanelBackend) error {
+	var errs []error
 	for _, b := range backends {
 		if err := b.backend.reload(ctx); err != nil {
 			logger.Printf("%s error: %v", b.name, err)
+			errs = append(errs, fmt.Errorf("%s: %w", b.name, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // setMainIPOnPanels tells every registered control panel to repoint its main
-// IP to the given address, logging but not aborting on individual errors.
-func setMainIPOnPanels(ctx context.Context, backends []namedPanelBackend, ip net.IP) {
+// IP to the given address, returning individual errors joined without aborting the others.
+func setMainIPOnPanels(ctx context.Context, backends []namedPanelBackend, ip net.IP) error {
+	var errs []error
 	for _, b := range backends {
 		if err := b.backend.setMainIP(ctx, ip); err != nil {
 			logger.Printf("%s error: %v", b.name, err)
+			errs = append(errs, fmt.Errorf("%s: %w", b.name, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // removeIPFromPanels tells every registered control panel to release an IP
-// address, logging but not aborting on individual errors.
-func removeIPFromPanels(ctx context.Context, backends []namedPanelBackend, ip net.IP) {
+// address, returning individual errors joined without aborting the others.
+func removeIPFromPanels(ctx context.Context, backends []namedPanelBackend, ip net.IP) error {
+	var errs []error
 	for _, b := range backends {
 		if err := b.backend.removeIP(ctx, ip); err != nil {
 			logger.Printf("%s error: %v", b.name, err)
+			errs = append(errs, fmt.Errorf("%s: %w", b.name, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // reorderPrimaryAddress returns addrs with target moved to the front, making it

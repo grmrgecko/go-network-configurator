@@ -553,12 +553,12 @@ func (c *linuxConfigurator) AddAddress(ctx context.Context, iface string, addr *
 	applied = true
 
 	// Update configuration files. Skip control panels when skipPanels is set.
-	applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
+	saveErr := applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
 	if !c.skipPanels {
-		reloadPanels(ctx, c.panelBackends)
+		saveErr = errors.Join(saveErr, reloadPanels(ctx, c.panelBackends))
 	}
 
-	return nil
+	return notPersisted(saveErr)
 }
 
 // Promote an existing address to be the primary address of its family. The
@@ -662,12 +662,11 @@ func (c *linuxConfigurator) SetPrimaryAddress(ctx context.Context, iface string,
 	// fall through to re-apply the configuration so it matches the running state.
 	if len(familyAddrs) != 0 && familyAddrs[0].IPNet.IP.Equal(addr.IP) {
 		addresses, _ = reorderPrimaryAddress(addresses, addr)
-		applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
+		saveErr := applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
 		if !c.skipPanels {
-			reloadPanels(ctx, c.panelBackends)
-			setMainIPOnPanels(ctx, c.panelBackends, addr.IP)
+			saveErr = errors.Join(saveErr, reloadPanels(ctx, c.panelBackends), setMainIPOnPanels(ctx, c.panelBackends, addr.IP))
 		}
-		return nil
+		return notPersisted(saveErr)
 	}
 
 	// Build the desired runtime order with the target address first.
@@ -747,13 +746,12 @@ func (c *linuxConfigurator) SetPrimaryAddress(ctx context.Context, iface string,
 	// Update configuration files with the reordered address list. Skip control
 	// panels when skipPanels is set.
 	addresses, _ = reorderPrimaryAddress(addresses, addr)
-	applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
+	saveErr := applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
 	if !c.skipPanels {
-		reloadPanels(ctx, c.panelBackends)
-		setMainIPOnPanels(ctx, c.panelBackends, addr.IP)
+		saveErr = errors.Join(saveErr, reloadPanels(ctx, c.panelBackends), setMainIPOnPanels(ctx, c.panelBackends, addr.IP))
 	}
 
-	return nil
+	return notPersisted(saveErr)
 }
 
 // Remove an IP address.
@@ -898,12 +896,13 @@ func (c *linuxConfigurator) RemoveAddress(ctx context.Context, iface string, add
 
 	// Update configuration files. When skipPanels is set, control panels are
 	// left untouched and only the network-manager files are rewritten.
+	var saveErr error
 	if !c.skipPanels {
-		removeIPFromPanels(ctx, c.panelBackends, addr.IP)
+		saveErr = removeIPFromPanels(ctx, c.panelBackends, addr.IP)
 	}
-	applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
+	saveErr = errors.Join(saveErr, applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6))
 
-	return nil
+	return notPersisted(saveErr)
 }
 
 // Add a static route.
@@ -987,9 +986,7 @@ routeLoop:
 	}
 
 	// Update configuration files.
-	applyIfaceRoutes(ctx, c.ifaceBackends, iface, staticRoutes)
-
-	return nil
+	return notPersisted(applyIfaceRoutes(ctx, c.ifaceBackends, iface, staticRoutes))
 }
 
 // Remove a static route.
@@ -1064,9 +1061,7 @@ routeLoop:
 	}
 
 	// Update configuration files.
-	applyIfaceRoutes(ctx, c.ifaceBackends, iface, staticRoutes)
-
-	return nil
+	return notPersisted(applyIfaceRoutes(ctx, c.ifaceBackends, iface, staticRoutes))
 }
 
 // Set the DNS servers and search domains for an interface. The change is
@@ -1075,9 +1070,9 @@ routeLoop:
 // /etc/resolv.conf where resolvectl is unavailable) so it takes effect
 // immediately rather than only on the next reload.
 func (c *linuxConfigurator) SetDNS(ctx context.Context, iface string, servers []net.IP, searchDomains []string) error {
-	applyIfaceDNS(ctx, c.ifaceBackends, iface, servers, searchDomains)
+	saveErr := applyIfaceDNS(ctx, c.ifaceBackends, iface, servers, searchDomains)
 	applyLiveDNS(ctx, iface, servers, searchDomains)
-	return nil
+	return notPersisted(saveErr)
 }
 
 // Enable or disable the DHCP client for each address family on an interface.

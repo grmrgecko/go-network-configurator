@@ -31,7 +31,10 @@ A single `Configurator` applies every change in two layers:
 
 Backends are auto-detected at construction time. A host running both netplan and
 cloud-init, for example, has both files kept in sync; a failure writing one
-backend is logged but does not abort the others.
+backend does not abort the others. When the runtime change succeeded but a
+backend or control panel failed to save it, the call returns an error wrapping
+`netconfig.ErrNotPersisted` that names each failed backend; the live change is
+kept, so check with `errors.Is` and fix the backend before a reboot undoes it.
 
 ## Supported backends
 

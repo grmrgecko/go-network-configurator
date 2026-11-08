@@ -496,12 +496,12 @@ func (c *windowsConfigurator) AddAddress(ctx context.Context, iface string, addr
 	}
 
 	// Update configuration files. Skip control panels when skipPanels is set.
-	applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
+	saveErr := applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
 	if !c.skipPanels {
-		reloadPanels(ctx, c.panelBackends)
+		saveErr = errors.Join(saveErr, reloadPanels(ctx, c.panelBackends))
 	}
 
-	return nil
+	return notPersisted(saveErr)
 }
 
 // prefixOf converts one address to the netip.Prefix winipcfg takes.
@@ -632,13 +632,12 @@ func (c *windowsConfigurator) SetPrimaryAddress(ctx context.Context, iface strin
 
 	// Update configuration files with the reordered address list. Skip control
 	// panels when skipPanels is set.
-	applyIfaceAddresses(ctx, c.ifaceBackends, iface, reordered, gateway4, gateway6)
+	saveErr := applyIfaceAddresses(ctx, c.ifaceBackends, iface, reordered, gateway4, gateway6)
 	if !c.skipPanels {
-		reloadPanels(ctx, c.panelBackends)
-		setMainIPOnPanels(ctx, c.panelBackends, addr.IP)
+		saveErr = errors.Join(saveErr, reloadPanels(ctx, c.panelBackends), setMainIPOnPanels(ctx, c.panelBackends, addr.IP))
 	}
 
-	return nil
+	return notPersisted(saveErr)
 }
 
 // Remove an IP address.
@@ -774,12 +773,13 @@ func (c *windowsConfigurator) RemoveAddress(ctx context.Context, iface string, a
 
 	// Update configuration files. When skipPanels is set, control panels are
 	// left untouched and only the network-manager files are rewritten.
+	var saveErr error
 	if !c.skipPanels {
-		removeIPFromPanels(ctx, c.panelBackends, addr.IP)
+		saveErr = removeIPFromPanels(ctx, c.panelBackends, addr.IP)
 	}
-	applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6)
+	saveErr = errors.Join(saveErr, applyIfaceAddresses(ctx, c.ifaceBackends, iface, addresses, gateway4, gateway6))
 
-	return nil
+	return notPersisted(saveErr)
 }
 
 // Add a static route.
@@ -910,9 +910,7 @@ routeLoop:
 	}
 
 	// Update configuration files.
-	applyIfaceRoutes(ctx, c.ifaceBackends, iface, staticRoutes)
-
-	return nil
+	return notPersisted(applyIfaceRoutes(ctx, c.ifaceBackends, iface, staticRoutes))
 }
 
 // Remove a static route.
@@ -1043,9 +1041,7 @@ routeLoop:
 	}
 
 	// Update configuration files.
-	applyIfaceRoutes(ctx, c.ifaceBackends, iface, staticRoutes)
-
-	return nil
+	return notPersisted(applyIfaceRoutes(ctx, c.ifaceBackends, iface, staticRoutes))
 }
 
 // Set the DNS servers and search domains for an interface. The change is
@@ -1053,9 +1049,9 @@ routeLoop:
 // reboot, and also applied to the live adapter via winipcfg so it takes effect
 // immediately.
 func (c *windowsConfigurator) SetDNS(ctx context.Context, iface string, servers []net.IP, searchDomains []string) error {
-	applyIfaceDNS(ctx, c.ifaceBackends, iface, servers, searchDomains)
+	saveErr := applyIfaceDNS(ctx, c.ifaceBackends, iface, servers, searchDomains)
 	applyLiveDNSWindows(ctx, iface, servers, searchDomains)
-	return nil
+	return notPersisted(saveErr)
 }
 
 // runNetsh runs netsh and folds its output into any error. netsh reports its

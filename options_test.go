@@ -137,7 +137,9 @@ func TestApplyIfaceDNS(t *testing.T) {
 		{name: "failing", backend: failing},
 		{name: "ok", backend: ok},
 	}
-	applyIfaceDNS(context.Background(), backends, "eth0", []net.IP{net.ParseIP("8.8.8.8")}, []string{"example.com"})
+	err := applyIfaceDNS(context.Background(), backends, "eth0", []net.IP{net.ParseIP("8.8.8.8")}, []string{"example.com"})
+	require.Error(t, err, "a failing backend is reported")
+	assert.Contains(t, err.Error(), "failing: boom", "the error names the backend")
 	assert.Equal(t, 1, failing.dnsCalls)
 	assert.Equal(t, 1, ok.dnsCalls)
 }

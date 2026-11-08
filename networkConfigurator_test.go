@@ -255,7 +255,8 @@ func (f *fakePanelBackend) removeIP(_ context.Context, addr net.IP) error {
 }
 
 // Every registered backend must be invoked even when an earlier backend
-// returns an error, since each writes an independent configuration.
+// returns an error, since each writes an independent configuration, and the
+// failure must reach the caller rather than only the log.
 func TestApplyIfaceAddresses(t *testing.T) {
 	failing := &fakeIfaceBackend{err: errors.New("boom")}
 	ok := &fakeIfaceBackend{}
@@ -263,7 +264,9 @@ func TestApplyIfaceAddresses(t *testing.T) {
 		{name: "failing", backend: failing},
 		{name: "ok", backend: ok},
 	}
-	applyIfaceAddresses(context.Background(), backends, "eth0", nil, nil, nil)
+	err := applyIfaceAddresses(context.Background(), backends, "eth0", nil, nil, nil)
+	require.Error(t, err, "a failing backend is reported")
+	assert.Contains(t, err.Error(), "failing: boom", "the error names the backend")
 	assert.Equal(t, 1, failing.addrCalls)
 	assert.Equal(t, 1, ok.addrCalls)
 }
@@ -275,7 +278,9 @@ func TestApplyIfaceRoutes(t *testing.T) {
 		{name: "failing", backend: failing},
 		{name: "ok", backend: ok},
 	}
-	applyIfaceRoutes(context.Background(), backends, "eth0", nil)
+	err := applyIfaceRoutes(context.Background(), backends, "eth0", nil)
+	require.Error(t, err, "a failing backend is reported")
+	assert.Contains(t, err.Error(), "failing: boom", "the error names the backend")
 	assert.Equal(t, 1, failing.routeCalls)
 	assert.Equal(t, 1, ok.routeCalls)
 }
@@ -287,7 +292,9 @@ func TestReloadPanels(t *testing.T) {
 		{name: "failing", backend: failing},
 		{name: "ok", backend: ok},
 	}
-	reloadPanels(context.Background(), backends)
+	err := reloadPanels(context.Background(), backends)
+	require.Error(t, err, "a failing backend is reported")
+	assert.Contains(t, err.Error(), "failing: boom", "the error names the backend")
 	assert.Equal(t, 1, failing.reloadCalls)
 	assert.Equal(t, 1, ok.reloadCalls)
 }
@@ -299,7 +306,9 @@ func TestSetMainIPOnPanels(t *testing.T) {
 		{name: "failing", backend: failing},
 		{name: "ok", backend: ok},
 	}
-	setMainIPOnPanels(context.Background(), backends, net.ParseIP("192.0.2.5"))
+	err := setMainIPOnPanels(context.Background(), backends, net.ParseIP("192.0.2.5"))
+	require.Error(t, err, "a failing backend is reported")
+	assert.Contains(t, err.Error(), "failing: boom", "the error names the backend")
 	assert.Equal(t, 1, failing.setMainIPCalls)
 	assert.Equal(t, 1, ok.setMainIPCalls)
 }
@@ -311,7 +320,9 @@ func TestRemoveIPFromPanels(t *testing.T) {
 		{name: "failing", backend: failing},
 		{name: "ok", backend: ok},
 	}
-	removeIPFromPanels(context.Background(), backends, net.ParseIP("192.0.2.5"))
+	err := removeIPFromPanels(context.Background(), backends, net.ParseIP("192.0.2.5"))
+	require.Error(t, err, "a failing backend is reported")
+	assert.Contains(t, err.Error(), "failing: boom", "the error names the backend")
 	assert.Equal(t, 1, failing.removeIPCalls)
 	assert.Equal(t, 1, ok.removeIPCalls)
 }
@@ -382,4 +393,14 @@ func equalIPs(a, b []net.IP) bool {
 		}
 	}
 	return true
+}
+
+// TestNotPersisted pins that save failures are reported as ErrNotPersisted, so a
+// caller can tell a live but unsaved change from one that was rolled back, and
+// that no failure means no error.
+func TestNotPersisted(t *testing.T) {
+	assert.NoError(t, notPersisted(nil, nil))
+	err := notPersisted(nil, errors.New("netplan: boom"))
+	assert.ErrorIs(t, err, ErrNotPersisted)
+	assert.Contains(t, err.Error(), "netplan: boom")
 }
