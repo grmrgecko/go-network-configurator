@@ -208,6 +208,47 @@ func linkIsPhysical(link netlink.Link) bool {
 	return link.Type() == "device"
 }
 
+// addrsInAddedOrder returns a link's addresses oldest first, so the first
+// address of each family is its primary. The kernel lists IPv4 addresses in the
+// order they were added, primaries ahead of their secondaries, but inserts each
+// IPv6 address ahead of the existing addresses of its scope, so it lists IPv6
+// newest first. Reversing the IPv6 addresses in place puts them oldest first,
+// and keeps an IPv6 address a caller adds from being taken as the primary or
+// written to the configuration ahead of the one that was there.
+func addrsInAddedOrder(addrs []netlink.Addr) []netlink.Addr {
+	ordered := append([]netlink.Addr{}, addrs...)
+	var v6 []int
+	for i, a := range ordered {
+		if a.IP.To4() == nil {
+			v6 = append(v6, i)
+		}
+	}
+	for i, j := 0, len(v6)-1; i < j; i, j = i+1, j-1 {
+		ordered[v6[i]], ordered[v6[j]] = ordered[v6[j]], ordered[v6[i]]
+	}
+	return ordered
+}
+
+// addrLabel returns the label for an address added to iface. InterWorx offers
+// to import only the IPv4 addresses that carry an alias label, as ifconfig
+// shows them, so with InterWorx present an IPv4 address is labelled iface:nc.
+// A label past the kernel's 15 character limit is left off.
+func (c *linuxConfigurator) addrLabel(iface string, ip net.IP) string {
+	if ip.To4() == nil {
+		return ""
+	}
+	for _, b := range c.panelBackends {
+		if _, ok := b.backend.(*interworx); !ok {
+			continue
+		}
+		if label := iface + ":nc"; len(label) <= 15 {
+			return label
+		}
+		logger.Printf("Interworx can't import %s: interface %s is too long to label the address", ip, iface)
+	}
+	return ""
+}
+
 // Get list of interfaces and their configs.
 func (c *linuxConfigurator) GetInterfaces(ctx context.Context) (interfaces []*Interface, err error) {
 	// Connect to netlink.
@@ -245,7 +286,7 @@ func (c *linuxConfigurator) GetInterfaces(ctx context.Context) (interfaces []*In
 		if err != nil {
 			return nil, err
 		}
-		for _, addr := range addrs {
+		for _, addr := range addrsInAddedOrder(addrs) {
 			if addr.IP.IsLinkLocalUnicast() {
 				continue
 			}
@@ -360,6 +401,7 @@ func (c *linuxConfigurator) AddAddress(ctx context.Context, iface string, addr *
 	if err != nil {
 		return err
 	}
+	addrs = addrsInAddedOrder(addrs)
 	for _, address := range addrs {
 		// Save a copy of every non-link-local address before any mutation.
 		// This must be a distinct *net.IPNet, not address.IPNet itself: when
@@ -395,7 +437,7 @@ func (c *linuxConfigurator) AddAddress(ctx context.Context, iface string, addr *
 		if pingTest(ctx, addr.IP.String(), c.pingCount, c.pingTimeout) {
 			return fmt.Errorf("the ip we are adding is responding to ping")
 		}
-		err = h.AddrAdd(link, &netlink.Addr{IPNet: addr})
+		err = h.AddrAdd(link, &netlink.Addr{IPNet: addr, Label: c.addrLabel(iface, addr.IP)})
 		if err != nil {
 			return err
 		}
@@ -597,6 +639,7 @@ func (c *linuxConfigurator) SetPrimaryAddress(ctx context.Context, iface string,
 	if err != nil {
 		return err
 	}
+	addrs = addrsInAddedOrder(addrs)
 	for _, address := range addrs {
 		if address.IPNet.IP.Equal(addr.IP) {
 			exists = true
@@ -609,7 +652,7 @@ func (c *linuxConfigurator) SetPrimaryAddress(ctx context.Context, iface string,
 
 		addresses = append(addresses, address.IPNet)
 
-		// Collect this family's addresses in kernel order for the reorder.
+		// Collect this family's addresses oldest first for the reorder.
 		isV4 := address.IP.To4() != nil
 		if (family == netlink.FAMILY_V4) == isV4 {
 			familyAddrs = append(familyAddrs, address)
@@ -819,8 +862,10 @@ func (c *linuxConfigurator) RemoveAddress(ctx context.Context, iface string, add
 	if err != nil {
 		return err
 	}
+	addrs = addrsInAddedOrder(addrs)
+
 	// Determine the current primary address of the same family: the first
-	// non-link-local address of the family in kernel order. Removing the
+	// non-link-local address of the family added. Removing the
 	// primary changes the system's source address and can leave a control
 	// panel without a main IP, so it is refused unless explicitly allowed.
 	isV4 := family == netlink.FAMILY_V4

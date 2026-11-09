@@ -260,6 +260,85 @@ func TestLinuxRemovePrimaryRefused(t *testing.T) {
 	assert.NoError(t, c.RemoveAddress(context.Background(), name, primaryIP), "RemoveAddress with allowPrimaryRemoval")
 }
 
+// TestAddrsInAddedOrder pins the order the kernel lists addresses in: IPv4
+// oldest first and IPv6 newest first. Each family comes back oldest first, in
+// the positions the kernel gave that family.
+func TestAddrsInAddedOrder(t *testing.T) {
+	addr := func(s string) netlink.Addr {
+		ip, n, err := net.ParseCIDR(s)
+		require.NoError(t, err)
+		n.IP = ip
+		return netlink.Addr{IPNet: n}
+	}
+	tests := []struct {
+		name   string
+		kernel []string
+		want   []string
+	}{
+		{"empty", nil, nil},
+		{"ipv4 kept", []string{"192.0.2.10/24", "192.0.2.11/24"}, []string{"192.0.2.10/24", "192.0.2.11/24"}},
+		{
+			"ipv6 reversed around ipv4",
+			[]string{"192.0.2.10/24", "2001:db8::30/64", "192.0.2.11/24", "2001:db8::20/64", "2001:db8::10/64", "fe80::1/64"},
+			[]string{"192.0.2.10/24", "fe80::1/64", "192.0.2.11/24", "2001:db8::10/64", "2001:db8::20/64", "2001:db8::30/64"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var in []netlink.Addr
+			for _, s := range tt.kernel {
+				in = append(in, addr(s))
+			}
+			var got []string
+			for _, a := range addrsInAddedOrder(in) {
+				got = append(got, a.IPNet.String())
+			}
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestLinuxIPv6PrimaryIsOldest verifies that the kernel listing an IPv6
+// address newest first doesn't make an added address the primary: it can be
+// removed, it's written to the configuration after the original, and the
+// original is still refused as the primary.
+func TestLinuxIPv6PrimaryIsOldest(t *testing.T) {
+	tearDown := setupNetlinkTest(t)
+	defer tearDown()
+
+	h, err := netlink.NewHandle()
+	require.NoError(t, err)
+	defer h.Close()
+
+	name := "test_enp1s0"
+	link := netlink.Link(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}})
+	require.NoError(t, h.LinkAdd(link))
+	require.NoError(t, h.LinkSetUp(link))
+	original := &net.IPNet{IP: net.ParseIP("2001:db8::10"), Mask: net.CIDRMask(64, 128)}
+	require.NoError(t, h.AddrAdd(link, &netlink.Addr{IPNet: original, Flags: unix.IFA_F_NODAD}))
+
+	c := newPingerConfigurator("test_success")
+	backend := &fakeIfaceBackend{}
+	c.ifaceBackends = []namedIfaceBackend{{"fake", backend}}
+
+	// Add a second address, then a third with the second already present, so
+	// the kernel lists them ahead of the original.
+	added := &net.IPNet{IP: net.ParseIP("2001:db8::20"), Mask: net.CIDRMask(64, 128)}
+	third := &net.IPNet{IP: net.ParseIP("2001:db8::30"), Mask: net.CIDRMask(64, 128)}
+	require.NoError(t, c.AddAddress(context.Background(), name, added, nil), "AddAddress")
+	require.NoError(t, c.AddAddress(context.Background(), name, third, nil), "AddAddress")
+	var written []string
+	for _, a := range backend.lastAddrs {
+		written = append(written, a.String())
+	}
+	assert.Equal(t, []string{"2001:db8::10/64", "2001:db8::20/64", "2001:db8::30/64"}, written, "configuration order")
+
+	// The added addresses can be removed; the original is the primary.
+	assert.NoError(t, c.RemoveAddress(context.Background(), name, third), "RemoveAddress of the newest address")
+	assert.NoError(t, c.RemoveAddress(context.Background(), name, added), "RemoveAddress of an added address")
+	assert.ErrorContains(t, c.RemoveAddress(context.Background(), name, original), "refusing to remove primary address")
+}
+
 func TestLinuxConfigurator(t *testing.T) {
 	tearDown := setupNetlinkTest(t)
 	defer tearDown()
@@ -511,4 +590,18 @@ func TestLinuxConfigurator(t *testing.T) {
 	// Read the current file and expected state.
 	err = testVerifyResults(resultsDir, tmpDir, 5)
 	require.NoError(t, err)
+}
+
+// TestAddrLabel verifies that only IPv4 addresses are labelled, and only with
+// InterWorx present, since its import skips unlabelled IPv4 addresses.
+func TestAddrLabel(t *testing.T) {
+	plain := &linuxConfigurator{configOptions: &configOptions{}}
+	iworx := &linuxConfigurator{configOptions: &configOptions{}}
+	iworx.panelBackends = []namedPanelBackend{{"Interworx", new(interworx)}}
+
+	assert.Equal(t, "", plain.addrLabel("em1", net.ParseIP("192.0.2.77")), "no InterWorx")
+	assert.Equal(t, "em1:nc", iworx.addrLabel("em1", net.ParseIP("192.0.2.77")), "IPv4 with InterWorx")
+	assert.Equal(t, "", iworx.addrLabel("em1", net.ParseIP("2001:db8::77")), "IPv6 with InterWorx")
+	assert.Equal(t, "eth0.1556:nc", iworx.addrLabel("eth0.1556", net.ParseIP("192.0.2.77")), "VLAN interface")
+	assert.Equal(t, "", iworx.addrLabel("enp1s0f0np0.15", net.ParseIP("192.0.2.77")), "label past 15 characters")
 }

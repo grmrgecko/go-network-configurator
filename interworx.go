@@ -3,6 +3,7 @@ package netconfig
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -127,6 +128,7 @@ func (p *interworx) removeIP(ctx context.Context, addr net.IP) error {
 	var privateIPs []net.IP
 
 	// Parse the IP list.
+	found := false
 	for _, line := range out {
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
@@ -135,6 +137,9 @@ func (p *interworx) removeIP(ctx context.Context, addr net.IP) error {
 
 		// Parse the IP field.
 		ip := net.ParseIP(fields[0])
+		if ip == nil {
+			continue
+		}
 
 		// Skip IP addresses of a different type.
 		if ip.To4() == nil && !isIPv6 {
@@ -148,6 +153,7 @@ func (p *interworx) removeIP(ctx context.Context, addr net.IP) error {
 		// set the shared IP to it. Otherwise, associate other IP types to public/private IP
 		// lists to allow us to select an IP where a shared IP doesn't exist.
 		if ip.Equal(addr) {
+			found = true
 			continue
 		} else if fields[3] == "shared" && !ip.IsPrivate() {
 			sharedIP = ip
@@ -161,6 +167,12 @@ func (p *interworx) removeIP(ctx context.Context, addr net.IP) error {
 				privateIPs = append(privateIPs, ip)
 			}
 		}
+	}
+
+	// An address InterWorx doesn't have has no sites to move, and nodeworx
+	// refuses to delete it.
+	if !found {
+		return nil
 	}
 
 	// If no shared IP, try public IP and private IP association instead.
@@ -207,14 +219,41 @@ func (*interworx) setMainIP(ctx context.Context, addr net.IP) error {
 	return nil
 }
 
-// Tell interworx to reload the available IP addresses.
-func (*interworx) reload(ctx context.Context) error {
-	out, err := runCommand(ctx, nodeworxBin, "-u", "-n", "-c", "Ip", "-a", "import", "--ip", "all")
+// reload imports every address InterWorx offers to import. InterWorx 5 takes
+// one address per `Ip import --ip`, from the choices it lists, and rejects
+// "all"; with nothing to import, there is nothing to do.
+func (p *interworx) reload(ctx context.Context) error {
+	help, err := runCommand(ctx, nodeworxBin, "-u", "-n", "-c", "Ip", "-a", "import", "-h")
 	if err != nil {
 		return err
 	}
-	if len(out) != 0 {
-		logger.Println("Interworx output:", strings.Join(out, "\n"))
+	var errs []error
+	for _, ip := range nodeworxChoices(help, "--ip") {
+		out, err := runCommand(ctx, nodeworxBin, "-u", "-n", "-c", "Ip", "-a", "import", "--ip", ip)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("importing %s: %w", ip, err))
+			continue
+		}
+		if len(out) != 0 {
+			logger.Println("Interworx output:", strings.Join(out, "\n"))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// nodeworxChoices returns the values nodeworx's help lists for an option, as
+// in "--ip <string>            192.0.2.10|2001:db8::10". An option listed
+// without values has none to offer.
+func nodeworxChoices(help []string, option string) []string {
+	for _, line := range help {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != option {
+			continue
+		}
+		if len(fields) < 3 {
+			return nil
+		}
+		return strings.Split(fields[len(fields)-1], "|")
 	}
 	return nil
 }

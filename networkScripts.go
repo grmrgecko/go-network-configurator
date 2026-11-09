@@ -100,6 +100,11 @@ func (ns *networkScripts) EnsureInterface(name string) *nsInterface {
 
 // Parse a file that should only contain key=value data.
 func parseKeyValueFile(fd *os.File) (map[string]string, error) {
+	return parseKeyValue(fd, fd.Name())
+}
+
+// parseKeyValue reads key=value data from r, naming name in its errors.
+func parseKeyValue(r io.Reader, name string) (map[string]string, error) {
 	// Setup the response.
 	resp := make(map[string]string)
 
@@ -110,7 +115,7 @@ func parseKeyValueFile(fd *os.File) (map[string]string, error) {
 	var key string
 	var value string
 
-	scanner := bufio.NewScanner(fd)
+	scanner := bufio.NewScanner(r)
 lineLoop:
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -167,7 +172,7 @@ lineLoop:
 			// If equal sign and not in a quote, handle key logic.
 			if b == '=' && !inDoubleQuote && !inSingleQuote {
 				if readKey {
-					return nil, fmt.Errorf("invalid file syntax in %s", fd.Name())
+					return nil, fmt.Errorf("invalid file syntax in %s", name)
 				}
 				key = builder.String()
 				builder.Reset()
@@ -187,7 +192,7 @@ lineLoop:
 					} else if b == '#' {
 						break readLoop
 					} else {
-						return nil, fmt.Errorf("invalid file syntax in %s", fd.Name())
+						return nil, fmt.Errorf("invalid file syntax in %s", name)
 					}
 				}
 				break
@@ -204,7 +209,7 @@ lineLoop:
 
 		// If we didn't read a key, that's invalid.
 		if !readKey {
-			return nil, fmt.Errorf("invalid file syntax in %s", fd.Name())
+			return nil, fmt.Errorf("invalid file syntax in %s", name)
 		}
 
 		// At this point, we have fully read the key/value.
@@ -632,6 +637,89 @@ func (ns *networkScripts) GetInterfaces() (interfaces []*Interface, err error) {
 	return
 }
 
+// nsKeyLine matches an ifcfg assignment, capturing the key and its value as written.
+var nsKeyLine = regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$`)
+
+// renderIfcfg writes config over the lines of an existing ifcfg file. Each key
+// keeps its line, left as written when its value is unchanged, so comments,
+// blank lines, key order and quoting survive, as do the #IWORX lines InterWorx
+// keeps there. A changed value keeps its line's quoting, a removed key loses
+// its line, and new keys follow in name order. A file with a value quoted
+// across lines is written fresh, as it can't be rewritten line by line.
+func renderIfcfg(orig []byte, config map[string]string) []byte {
+	var lines []string
+	if len(orig) != 0 {
+		lines = strings.Split(strings.TrimSuffix(string(orig), "\n"), "\n")
+	}
+	for _, line := range lines {
+		if m := nsKeyLine.FindStringSubmatch(line); m != nil {
+			if _, ok := ifcfgValue(line, m[1]); !ok {
+				lines = nil
+				break
+			}
+		}
+	}
+
+	// Rewrite the existing lines.
+	var b strings.Builder
+	written := make(map[string]bool)
+	for _, line := range lines {
+		m := nsKeyLine.FindStringSubmatch(line)
+		if m == nil {
+			b.WriteString(line + "\n")
+			continue
+		}
+		key := m[1]
+		val, ok := config[key]
+		if !ok || written[key] {
+			continue
+		}
+		written[key] = true
+		if cur, _ := ifcfgValue(line, key); cur == val {
+			b.WriteString(line + "\n")
+		} else {
+			b.WriteString(key + "=" + ifcfgQuote(val, strings.TrimSpace(m[2])) + "\n")
+		}
+	}
+
+	// Add the new keys.
+	var keys []string
+	for key := range config {
+		if !written[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		b.WriteString(key + "=" + ifcfgQuote(config[key], "") + "\n")
+	}
+	return []byte(b.String())
+}
+
+// ifcfgValue returns the value line assigns to key, as parseKeyValue reads it.
+// It reports false for a line that doesn't finish its value.
+func ifcfgValue(line, key string) (string, bool) {
+	kv, err := parseKeyValue(strings.NewReader(line), "")
+	if err != nil {
+		return "", false
+	}
+	val, ok := kv[key]
+	return val, ok
+}
+
+// ifcfgQuote formats val for an ifcfg file, in the quotes the line's previous
+// value was written in. A value with no previous quoting is quoted only when
+// the shell that sources the file would split or expand it.
+func ifcfgQuote(val, prev string) string {
+	switch {
+	case strings.HasPrefix(prev, "'") && !strings.Contains(val, "'"):
+		return "'" + val + "'"
+	case strings.HasPrefix(prev, "\""), val != "" && strings.ContainsAny(val, " \t\"'\\$`#;&|<>()*?[]{}~"):
+		return "\"" + strings.ReplaceAll(val, "\"", "\\\"") + "\""
+	}
+	return val
+}
+
 // Save an interface to script.
 func (n *nsInterface) Save(config map[string]string, configDir string, backupRetention int) error {
 	// Get config paths.
@@ -652,20 +740,20 @@ func (n *nsInterface) Save(config map[string]string, configDir string, backupRet
 	if err != nil {
 		return err
 	}
-	var keys []string
-	for key := range config {
-		keys = append(keys, key)
+	orig, rerr := os.ReadFile(configPath)
+	if rerr != nil && !os.IsNotExist(rerr) {
+		fd.Close()
+		os.Remove(tmpPath)
+		return rerr
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		val := config[key]
-		if strings.ContainsFunc(val, unicode.IsSpace) {
-			fmt.Fprintf(fd, "%s=\"%s\"\n", key, val)
-		} else {
-			fmt.Fprintf(fd, "%s=%s\n", key, val)
-		}
+	_, err = fd.Write(renderIfcfg(orig, config))
+	if cerr := fd.Close(); err == nil {
+		err = cerr
 	}
-	fd.Close()
+	if err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
 
 	// Backup existing configs.
 	prefix := fmt.Sprintf(".bak.%d.", time.Now().UnixNano())
@@ -840,6 +928,24 @@ func (ns *networkScripts) SetIfaceAddresses(_ context.Context, iface string, add
 		}
 	}
 
+	// Keep the link-local IPv6 addresses the file lists. Callers pass only the
+	// addresses they manage, and CentOS 6 hosts, InterWorx's among them, list
+	// the interface's link-local address as IPV6ADDR.
+	_, hadSecondaries := config["IPV6ADDR_SECONDARIES"]
+	for _, f := range strings.Fields(config["IPV6ADDR"] + " " + config["IPV6ADDR_SECONDARIES"]) {
+		ip, _, perr := net.ParseCIDR(f)
+		if perr != nil || !ip.IsLinkLocalUnicast() {
+			continue
+		}
+		listed := false
+		for _, addr := range addrs {
+			listed = listed || addr.IP.Equal(ip)
+		}
+		if !listed {
+			addrs6 = append(addrs6, f)
+		}
+	}
+
 	// Delete existing configs.
 	delete(config, "IPADDR6")
 	delete(config, "IPV6ADDR")
@@ -878,7 +984,7 @@ func (ns *networkScripts) SetIfaceAddresses(_ context.Context, iface string, add
 	if len(addrs6) != 0 {
 		config["IPV6ADDR"] = addrs6[0]
 		addrs6 = addrs6[1:]
-		if len(addrs6) != 0 {
+		if len(addrs6) != 0 || hadSecondaries {
 			config["IPV6ADDR_SECONDARIES"] = strings.Join(addrs6, " ")
 		}
 	}

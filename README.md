@@ -57,6 +57,10 @@ kept, so check with `errors.Is` and fix the backend before a reboot undoes it.
 | Plesk     | `/usr/sbin/plesk`                  |
 | InterWorx | `/usr/bin/nodeworx`                |
 
+InterWorx imports only the IPv4 addresses that carry an alias label, so with
+InterWorx present `AddAddress` labels an IPv4 address `<iface>:nc`. An interface
+name too long for the label leaves the address unlabelled and out of InterWorx.
+
 ### How service-managed backends are detected
 
 A service counts as managing the network when it is **running now** or
@@ -265,8 +269,10 @@ func main() {
 }
 ```
 
-The primary address is the first address listed on an interface.
-`SetPrimaryAddress` reorders an interface's addresses so the chosen IP is
+The primary address of a family is the first one added to the interface.
+`ip addr` lists IPv4 addresses in that order but IPv6 addresses newest first, so
+the IPv6 primary is the last one it lists; `GetInterfaces` lists both oldest
+first. `SetPrimaryAddress` reorders an interface's addresses so the chosen IP is
 first within its family, both in the running kernel and in the written
 configuration. The address must already be present on the interface
 (compose it with `AddAddress`); IPv4 and IPv6 each have their own primary.
